@@ -88,10 +88,35 @@ class WorldCupDataCompiler:
                 print(f"  [!] Scoreboard {date_str}: {exc}")
             cursor += timedelta(days=1)
             time.sleep(0.15)
-        result = sorted(ids)
-        print(f"[+] Discovered {len(result)} event IDs")
+        def discover_all_game_ids(self):
+        """
+        Scrapes the ESPN scoreboard endpoint to discover new matches.
+        Standardizes all IDs as strings to prevent sorting type errors.
+        """
+        print("Discovering game IDs...")
+        ids = set(self.SEED_GAME_IDS)
+        
+        try:
+            # Hit the ESPN scoreboard endpoint
+            response = requests.get(self.SCOREBOARD_URL, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                # Parse through the events and extract the game ID
+                for event in data.get('events', []):
+                    game_id = event.get('id')
+                    if game_id:
+                        ids.add(game_id)
+            else:
+                print(f"Warning: Scoreboard returned status code {response.status_code}")
+                
+        except Exception as e:
+            print(f"Error fetching live games: {e}")
+            
+        # THE FIX: Convert every ID in the set to a string before sorting
+        result = sorted([str(game_id) for game_id in ids])
+        
+        print(f"Discovered {len(result)} total matches to process.")
         return result
-
     # ------------------------------------------------------------------
     # Fetch per-match detail
     # ------------------------------------------------------------------
