@@ -5,13 +5,13 @@ from statsbombpy import sb
 
 class WorldCupDataCompiler:
     def __init__(self, tournament_id=43, season_id=106):
-        # The scoreboard endpoint can remain on fifa.world to track World Cup schedules
+        # Scoreboard tracks active tourney schedules
         self.scoreboard_url = "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard"
         self.tournament_id = tournament_id
         self.season_id = season_id
 
     def get_active_matches(self):
-        """Fetches all match IDs currently on the active tournament scoreboard."""
+        """Fetches all match IDs currently live or scheduled on the tournament scoreboard."""
         try:
             response = requests.get(self.scoreboard_url)
             data = response.json()
@@ -22,13 +22,16 @@ class WorldCupDataCompiler:
 
     def get_espn_match_details(self, game_id):
         """
-        FIXED: Using ESPN's universal cross-league endpoint path.
-        Omitting 'fifa.world' allows this script to fetch match IDs from any league/friendly.
+        FIXED: Added the missing '/all/' league path designator.
+        This forces ESPN's routing tables to correctly serve the summary payload.
         """
-        url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/summary?event={game_id}"
+        url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/all/summary?event={game_id}"
         try:
             res = requests.get(url)
-            return res.json()
+            if res.status_code == 200:
+                return res.json()
+            print(f"[-] API returned status code {res.status_code} for game {game_id}")
+            return None
         except Exception as e:
             print(f"[-] Error fetching ESPN game {game_id}: {e}")
             return None
@@ -84,25 +87,38 @@ class WorldCupDataCompiler:
             raw = self.get_espn_match_details(gid)
             if not raw: continue
             
-            header = raw.get('header', {})
-            competitors = header.get('competitors', [])
-            if len(competitors) < 2: continue
+            boxscore = raw.get('boxscore', {})
+            teams_list = boxscore.get('teams', [])
             
-            # Match metadata
-            t1_name = competitors[1].get('team', {}).get('displayName')
-            t2_name = competitors[0].get('team', {}).get('displayName')
+            # Defensive naming fallback logic
+            if len(teams_list) >= 2:
+                t1_name = teams_list[0].get('team', {}).get('displayName')
+                t2_name = teams_list[1].get('team', {}).get('displayName')
+            else:
+                header = raw.get('header', {})
+                competitors = header.get('competitors', [])
+                if len(competitors) < 2: 
+                    print(f"[-] Skipping Match ID {gid}: Match metadata structure unexpected.")
+                    continue
+                t1_name = competitors[1].get('team', {}).get('displayName')
+                t2_name = competitors[0].get('team', {}).get('displayName')
+            
             matchup_title = f"{t1_name} vs {t2_name}"
             
-            # Extract structures
-            boxscore = raw.get('boxscore', {})
-            teams_payload = {t.get('team', {}).get('displayName'): t.get('statistics', []) for t in boxscore.get('teams', [])}
+            # Map out stats safely
+            teams_payload = {}
+            for t in teams_list:
+                team_display = t.get('team', {}).get('displayName')
+                if team_display:
+                    teams_payload[team_display] = t.get('statistics', [])
+
             rosters = raw.get('rosters', [])
             plays = raw.get('plays', [])
             
-            # Try fetching high-fidelity spatial archives
+            # Attempt pulling StatsBomb high-fidelity map tracking arrays
             spatial_shots = self.fetch_statsbomb_spatial_shots(t1_name, t2_name)
 
-            # Textual parsing fallback if spatial data hasn't processed into archives yet
+            # Match text processing generator fallback if spatial data hasn't processed into archives yet
             if not spatial_shots:
                 print(f"    [!] StatsBomb archive unavailable. Extracting text log fallbacks...")
                 for p in plays:
@@ -161,8 +177,8 @@ if __name__ == "__main__":
     print(f"[+] Discovered active scoreboard matches: {active_ids}")
     
     if not active_ids:
-        print("[!] Scoreboard empty between match windows. Using sample match target ID...")
-        active_ids = [760417]
+        print("[!] Scoreboard empty between match windows. Using sample match target ID (2022 Final: Argentina vs France)...")
+        active_ids = [633850]
         
     compiled_data = compiler.compile_all_data(active_ids)
     print("[*] Generating production HTML web payload...")
