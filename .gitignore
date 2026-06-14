@@ -1,0 +1,32 @@
+# Python compilation caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+bin/
+lib/
+develop-eggs/
+dist/
+build/
+*.egg-info/
+
+# Integrated Development Environments (IDEs) & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.project
+.settings/
+
+# Operating System files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# Dynamic logging files
+*.log
