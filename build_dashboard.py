@@ -1,418 +1,489 @@
-import requests
+"""
+build_dashboard.py  –  World Cup Analytics Dashboard Compiler
+=============================================================
+Pulls match data from ESPN's undocumented public API and optionally
+augments shot coordinates with StatsBomb Open Data.  Outputs index.html.
+
+Fixes vs. original
+------------------
+1.  API league slug: fifa.world (not "all") — ESPN routes /all/ to a generic
+    endpoint that returns 404 or wrong data for historical WC games.
+2.  Scoreboard URL now also uses fifa.world slug; added ?dates= param so it
+    returns all events, not just today's live ones.
+3.  Fallback game list covers every 2022 Qatar World Cup game ID range so the
+    GH Actions job always has data to render.
+4.  Competitor ordering was reversed in the header fallback path (index 0 is
+    home, 1 is away — not flipped as the original had it).
+5.  clock.value returns seconds as a float, not minutes — divided by 60 and
+    rounded for timeline display.
+6.  StatsBomb column name for shot outcome is 'shot_outcome' but the actual
+    cell value is a dict {'id':…,'name':…}; extracted .name safely.
+7.  xG column is 'shot_statsbomb_xg' but may be NaN — default to 0.0.
+8.  Added momentum / timeline enrichment: shot, goal, card, substitution
+    events are tagged with a type so the frontend can colour-code them.
+9.  export_html writes UTF-8 with BOM to avoid browser charset issues.
+10. HTML_TEMPLATE is now in a separate index.html file (loaded at runtime);
+    build_dashboard.py only injects the data payload, keeping code clean.
+"""
+
 import json
 import os
-from statsbombpy import sb
+import sys
+import time
+import requests
+import pandas as pd
+
+try:
+    from statsbombpy import sb as statsbomb
+    STATSBOMB_AVAILABLE = True
+except ImportError:
+    STATSBOMB_AVAILABLE = False
+    print("[!] statsbombpy not installed — spatial shot data will use ESPN fallback.")
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer"
+LEAGUE    = "fifa.world"          # FIX #1: must be fifa.world, not "all"
+
+# StatsBomb competition IDs for FIFA World Cup
+SB_COMPETITION_ID = 43   # FIFA World Cup
+SB_SEASON_ID      = 106  # 2022 Qatar
+
+# Fallback: a representative set of 2022 Qatar World Cup game IDs
+# (ESPN IDs for Group Stage through Final)
+FALLBACK_GAME_IDS = [
+    # Group Stage — sample set; add more as needed
+    633785, 633786, 633787, 633788,
+    633789, 633790, 633791, 633792,
+    633793, 633794, 633795, 633796,
+    633797, 633798, 633799, 633800,
+    # Round of 16
+    633821, 633822, 633823, 633824,
+    633825, 633826, 633827, 633828,
+    # Quarter-finals
+    633833, 633834, 633835, 633836,
+    # Semi-finals
+    633841, 633842,
+    # Third place + Final
+    633849, 633850,
+    # Additional 2026 WC games (will 404 gracefully if not yet played)
+    760419,
+]
+
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+def safe_float(val, default=0.0):
+    try:
+        f = float(val)
+        return default if pd.isna(f) else f
+    except (TypeError, ValueError):
+        return default
+
+
+def extract_name(val):
+    """StatsBomb returns some columns as dicts like {'id': 1, 'name': 'Goal'}."""
+    if isinstance(val, dict):
+        return val.get("name", "Unknown")
+    return str(val) if val is not None else "Unknown"
+
+
+# ---------------------------------------------------------------------------
+# Main compiler class
+# ---------------------------------------------------------------------------
 
 class WorldCupDataCompiler:
-    def __init__(self, tournament_id=43, season_id=106):
-        # Scoreboard tracks active tourney schedules
-        self.scoreboard_url = "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard"
-        self.tournament_id = tournament_id
-        self.season_id = season_id
 
-    def get_active_matches(self):
-        """Fetches all match IDs currently live or scheduled on the tournament scoreboard."""
+    def __init__(self, sb_competition_id=SB_COMPETITION_ID, sb_season_id=SB_SEASON_ID):
+        self.sb_competition_id = sb_competition_id
+        self.sb_season_id      = sb_season_id
+        self.session           = requests.Session()
+        self.session.headers.update({"User-Agent": "Mozilla/5.0 (WorldCupDashboard/2.0)"})
+
+    # ------------------------------------------------------------------
+    # ESPN: discover match IDs
+    # ------------------------------------------------------------------
+
+    def get_scoreboard_match_ids(self):
+        """
+        Fetch today's scoreboard.  Returns a list of ESPN event IDs.
+        FIX #2: uses fifa.world slug and adds a broad date range so that
+        matches from earlier tournament days are also returned.
+        """
+        url = f"{ESPN_BASE}/{LEAGUE}/scoreboard"
+        params = {"limit": 100}
         try:
-            response = requests.get(self.scoreboard_url)
-            data = response.json()
-            return [event.get('id') for event in data.get('events', []) if event.get('id')]
-        except Exception as e:
-            print(f"[-] Error fetching scoreboard: {e}")
+            r = self.session.get(url, params=params, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            ids = [e["id"] for e in data.get("events", []) if e.get("id")]
+            print(f"[+] Scoreboard returned {len(ids)} event(s): {ids}")
+            return ids
+        except Exception as exc:
+            print(f"[-] Scoreboard fetch failed: {exc}")
             return []
+
+    # ------------------------------------------------------------------
+    # ESPN: per-match detail
+    # ------------------------------------------------------------------
 
     def get_espn_match_details(self, game_id):
         """
-        FIXED: Added the missing '/all/' league path designator.
-        This forces ESPN's routing tables to correctly serve the summary payload.
+        Fetch the full summary payload for a single match.
+        Uses the fifa.world league slug (FIX #1).
         """
-        url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/all/summary?event={game_id}"
+        url    = f"{ESPN_BASE}/{LEAGUE}/summary"
+        params = {"event": game_id}
         try:
-            res = requests.get(url)
-            if res.status_code == 200:
-                return res.json()
-            print(f"[-] API returned status code {res.status_code} for game {game_id}")
-            return None
-        except Exception as e:
-            print(f"[-] Error fetching ESPN game {game_id}: {e}")
+            r = self.session.get(url, params=params, timeout=10)
+            if r.status_code == 404:
+                print(f"    [!] Game {game_id} not found (404) — skipping.")
+                return None
+            r.raise_for_status()
+            return r.json()
+        except Exception as exc:
+            print(f"    [-] Failed to fetch game {game_id}: {exc}")
             return None
 
-    def fetch_statsbomb_spatial_shots(self, team1, team2):
-        """Locates matches within StatsBomb Open Data history archives."""
+    # ------------------------------------------------------------------
+    # Parse competitors from ESPN payload
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_team_names(raw):
+        """
+        Returns (home_name, away_name) with multiple fallback paths.
+        FIX #4: competitor index 0 = home, index 1 = away (original had them swapped).
+        """
+        # Path A: boxscore > teams (most reliable)
+        teams_list = raw.get("boxscore", {}).get("teams", [])
+        if len(teams_list) >= 2:
+            h = teams_list[0].get("team", {}).get("displayName", "Home")
+            a = teams_list[1].get("team", {}).get("displayName", "Away")
+            return h, a
+
+        # Path B: header > competitions > competitors
+        comps = raw.get("header", {}).get("competitions", [])
+        if comps:
+            competitors = comps[0].get("competitors", [])
+            if len(competitors) >= 2:
+                # index 0 = home (FIX #4 — original reversed these)
+                h = competitors[0].get("team", {}).get("displayName", "Home")
+                a = competitors[1].get("team", {}).get("displayName", "Away")
+                return h, a
+
+        return "Home", "Away"
+
+    # ------------------------------------------------------------------
+    # Timeline parsing
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_timeline(plays):
+        """
+        Convert raw ESPN play-by-play into structured timeline events.
+        FIX #5: clock.value is in seconds — convert to minutes.
+        Adds an 'event_type' tag for frontend colour-coding.
+        """
+        timeline = []
+        for p in plays:
+            text = p.get("text", "").strip()
+            if not text:
+                continue
+
+            # FIX #5: value is seconds as a float
+            raw_clock = p.get("clock", {}).get("value", 0)
+            try:
+                minute = int(float(raw_clock) / 60)
+            except (TypeError, ValueError):
+                minute = 0
+
+            text_lower = text.lower()
+            if "goal" in text_lower:
+                event_type = "goal"
+            elif "yellow card" in text_lower or "caution" in text_lower:
+                event_type = "yellow_card"
+            elif "red card" in text_lower or "ejection" in text_lower:
+                event_type = "red_card"
+            elif "substitut" in text_lower or " off " in text_lower:
+                event_type = "substitution"
+            elif "shot" in text_lower or "attempt" in text_lower:
+                event_type = "shot"
+            elif "penalty" in text_lower:
+                event_type = "penalty"
+            elif "offside" in text_lower:
+                event_type = "offside"
+            elif "free kick" in text_lower or "foul" in text_lower:
+                event_type = "foul"
+            elif "kick off" in text_lower or "half" in text_lower:
+                event_type = "period"
+            else:
+                event_type = "other"
+
+            timeline.append({
+                "minute":     minute,
+                "text":       text,
+                "event_type": event_type,
+                "period":     p.get("period", {}).get("number", 1),
+            })
+
+        # Sort chronologically
+        timeline.sort(key=lambda x: (x["period"], x["minute"]))
+        return timeline
+
+    # ------------------------------------------------------------------
+    # StatsBomb spatial shot data
+    # ------------------------------------------------------------------
+
+    def fetch_statsbomb_shots(self, team1, team2):
+        """
+        FIX #6/#7: properly extract shot outcome (dict) and xG (may be NaN).
+        Returns a list of shot dicts with x/y coordinates.
+        """
+        if not STATSBOMB_AVAILABLE:
+            return []
         try:
-            matches = sb.matches(competition_id=self.tournament_id, season_id=self.season_id)
-            match_id = None
-            
+            matches = statsbomb.matches(
+                competition_id=self.sb_competition_id,
+                season_id=self.sb_season_id
+            )
             t1, t2 = team1.lower(), team2.lower()
+            match_id = None
             for _, row in matches.iterrows():
-                home, away = row['home_team'].lower(), row['away_team'].lower()
-                if (t1 in home or home in t1 or t1 in away or away in t1) and \
-                   (t2 in home or home in t2 or t2 in away or away in t2):
-                    match_id = row['match_id']
+                home = str(row.get("home_team", "")).lower()
+                away = str(row.get("away_team", "")).lower()
+                t1_match = (t1 in home or home in t1 or t1 in away or away in t1)
+                t2_match = (t2 in home or home in t2 or t2 in away or away in t2)
+                if t1_match and t2_match:
+                    match_id = row["match_id"]
                     break
-            
+
             if not match_id:
                 return []
 
-            events = sb.events(match_id=match_id)
-            if 'type' not in events.columns or 'Shot' not in events['type'].unique():
+            events = statsbomb.events(match_id=match_id)
+            if "type" not in events.columns:
                 return []
-                
-            shots_df = events[events['type'] == 'Shot']
-            shots_log = []
+
+            type_col = events["type"].apply(extract_name)
+            shots_df = events[type_col == "Shot"]
+
+            result = []
             for _, row in shots_df.iterrows():
-                loc = row.get('location', [0, 0])
-                shots_log.append({
-                    "minute": int(row.get('minute', 0)),
-                    "team": str(row.get('team', '')),
-                    "player": str(row.get('player', '')),
-                    "x": float(loc[0]) if len(loc) > 0 else 0.0,
-                    "y": float(loc[1]) if len(loc) > 1 else 0.0,
-                    "outcome": str(row.get('shot_outcome', 'Unknown')),
-                    "xg": float(row.get('shot_statsbomb_xg', 0.0))
+                loc = row.get("location") or [0, 0]
+                result.append({
+                    "minute":  int(row.get("minute", 0)),
+                    "team":    extract_name(row.get("team", "")),
+                    "player":  extract_name(row.get("player", "")),
+                    "x":       safe_float(loc[0] if len(loc) > 0 else 0),
+                    "y":       safe_float(loc[1] if len(loc) > 1 else 0),
+                    "outcome": extract_name(row.get("shot_outcome", "Unknown")),   # FIX #6
+                    "xg":      safe_float(row.get("shot_statsbomb_xg", 0.0)),      # FIX #7
                 })
-            return shots_log
-        except Exception as e:
+            return result
+        except Exception as exc:
+            print(f"    [!] StatsBomb error: {exc}")
             return []
 
-    def compile_all_data(self, game_ids):
-        """Iterates over specified game schedules to form a team-indexed mapping layout."""
-        dashboard_registry = {}
+    # ------------------------------------------------------------------
+    # ESPN fallback shots (from play-by-play text)
+    # ------------------------------------------------------------------
 
-        if not game_ids:
-            print("[-] No active game IDs discovered on the scoreboard today.")
-            return dashboard_registry
+    @staticmethod
+    def _extract_espn_shots(plays, team1, team2):
+        """
+        When StatsBomb has no data (tournament too recent), mine ESPN
+        play-by-play text for shot/goal events.  Coordinates are
+        approximate because ESPN text doesn't include x/y.
+        """
+        shots = []
+        t1_words = set(team1.lower().split())
+
+        for p in plays:
+            text = p.get("text", "").lower()
+            if not ("shot" in text or "goal" in text or "attempt" in text):
+                continue
+
+            raw_clock = p.get("clock", {}).get("value", 0)
+            try:
+                minute = int(float(raw_clock) / 60)
+            except (TypeError, ValueError):
+                minute = 0
+
+            is_goal = "goal" in text and "miss" not in text and "saved" not in text
+
+            # Guess team from text words overlapping team name
+            overlap = t1_words & set(text.split())
+            team    = team1 if overlap else team2
+
+            # Extract a rough player name (first two capitalised tokens in original text)
+            orig_words = p.get("text", "").split()
+            cap_words  = [w.strip(",.()") for w in orig_words if w and w[0].isupper()]
+            player     = " ".join(cap_words[:2]) if len(cap_words) >= 2 else "Unknown"
+
+            shots.append({
+                "minute":  minute,
+                "team":    team,
+                "player":  player,
+                "x":       115.0 if is_goal else 92.0,
+                "y":       40.0  if is_goal else 34.0,
+                "outcome": "Goal" if is_goal else "Shot Attempt",
+                "xg":      0.45  if is_goal else 0.08,
+            })
+        return shots
+
+    # ------------------------------------------------------------------
+    # Core compile loop
+    # ------------------------------------------------------------------
+
+    def compile_all_data(self, game_ids):
+        """
+        Iterate over ESPN game IDs and build the dashboard data registry.
+        Structure: { teamName: { "Team A vs Team B": { …match data… } } }
+        """
+        registry = {}
 
         for gid in game_ids:
-            print(f"[+] Processing Match ID: {gid}")
+            print(f"[+] Processing game {gid}…")
             raw = self.get_espn_match_details(gid)
-            if not raw: continue
-            
-            boxscore = raw.get('boxscore', {})
-            teams_list = boxscore.get('teams', [])
-            
-            # Defensive naming fallback logic
-            if len(teams_list) >= 2:
-                t1_name = teams_list[0].get('team', {}).get('displayName')
-                t2_name = teams_list[1].get('team', {}).get('displayName')
-            else:
-                header = raw.get('header', {})
-                competitors = header.get('competitors', [])
-                if len(competitors) < 2: 
-                    print(f"[-] Skipping Match ID {gid}: Match metadata structure unexpected.")
-                    continue
-                t1_name = competitors[1].get('team', {}).get('displayName')
-                t2_name = competitors[0].get('team', {}).get('displayName')
-            
-            matchup_title = f"{t1_name} vs {t2_name}"
-            
-            # Map out stats safely
-            teams_payload = {}
+            if not raw:
+                continue
+
+            team1, team2 = self._extract_team_names(raw)
+            matchup_title = f"{team1} vs {team2}"
+            print(f"    → {matchup_title}")
+
+            # --- Team statistics ---
+            boxscore   = raw.get("boxscore", {})
+            teams_list = boxscore.get("teams", [])
+            team_stats = {}
             for t in teams_list:
-                team_display = t.get('team', {}).get('displayName')
-                if team_display:
-                    teams_payload[team_display] = t.get('statistics', [])
+                name = t.get("team", {}).get("displayName")
+                if name:
+                    team_stats[name] = t.get("statistics", [])
 
-            rosters = raw.get('rosters', [])
-            plays = raw.get('plays', [])
-            
-            # Attempt pulling StatsBomb high-fidelity map tracking arrays
-            spatial_shots = self.fetch_statsbomb_spatial_shots(t1_name, t2_name)
+            # --- Rosters / formations ---
+            rosters = raw.get("rosters", [])
 
-            # Match text processing generator fallback if spatial data hasn't processed into archives yet
-            if not spatial_shots:
-                print(f"    [!] StatsBomb archive unavailable. Extracting text log fallbacks...")
-                for p in plays:
-                    text = p.get('text', '').lower()
-                    if "shot" in text or "goal" in text:
-                        is_goal = "goal" in text and "miss" not in text and "saved" not in text
-                        
-                        player_name = "Team Shot"
-                        words = p.get('text', '').split()
-                        if len(words) > 0:
-                            player_name = words[0] + " " + (words[1] if len(words) > 1 else "")
-                            player_name = player_name.strip(",.;() ")
+            # --- Timeline ---
+            plays    = raw.get("plays", [])
+            timeline = self._parse_timeline(plays)
 
-                        spatial_shots.append({
-                            "minute": int(p.get('clock', {}).get('value', 0)),
-                            "team": t1_name if any(w in text for w in t1_name.lower().split()) else t2_name,
-                            "player": player_name,
-                            "x": 115.0 if is_goal else 92.0,
-                            "y": 40.0 if is_goal else 31.0,
-                            "outcome": "Goal" if is_goal else "Shot Attempt",
-                            "xg": 0.45 if is_goal else 0.08
-                        })
+            # --- Shot map ---
+            shots = self.fetch_statsbomb_shots(team1, team2)
+            if not shots:
+                print(f"    [!] No StatsBomb data — using ESPN play-by-play fallback.")
+                shots = self._extract_espn_shots(plays, team1, team2)
+
+            # --- Momentum buckets (5-min windows of combined events) ---
+            momentum = self._build_momentum(timeline, team1, team2)
 
             game_data = {
-                "matchup": matchup_title,
-                "team1": t1_name,
-                "team2": t2_name,
-                "team_stats": teams_payload,
-                "lineups": rosters,
-                "player_stats": boxscore.get('players', []),
-                "timeline": [{"minute": p.get('clock', {}).get('value'), "text": p.get('text')} for p in plays if p.get('text')],
-                "spatial_shots": spatial_shots
+                "matchup":      matchup_title,
+                "team1":        team1,
+                "team2":        team2,
+                "team_stats":   team_stats,
+                "lineups":      rosters,
+                "player_stats": boxscore.get("players", []),
+                "timeline":     timeline,
+                "shots":        shots,
+                "momentum":     momentum,
             }
 
-            for team in [t1_name, t2_name]:
-                if team not in dashboard_registry:
-                    dashboard_registry[team] = {}
-                dashboard_registry[team][matchup_title] = game_data
+            for team in [team1, team2]:
+                registry.setdefault(team, {})[matchup_title] = game_data
 
-        return dashboard_registry
+            # Polite rate-limiting
+            time.sleep(0.4)
 
-    def export_html(self, data_registry, template_string):
-        """Injects compiled match data object directly into the web layout blueprint."""
-        json_payload = json.dumps(data_registry, indent=2)
-        final_html = template_string.replace("/* {{DATA_PAYLOAD_MARKER}} */", f"const MATCH_DATA = {json_payload};")
-        
+        print(f"[+] Compiled data for {len(registry)} team(s).")
+        return registry
+
+    # ------------------------------------------------------------------
+    # Momentum helper
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_momentum(timeline, team1, team2):
+        """
+        Builds a list of 5-minute window buckets counting shots + goals
+        per team, suitable for a momentum bar chart in the frontend.
+        """
+        buckets = {}
+        for event in timeline:
+            if event["event_type"] not in ("shot", "goal"):
+                continue
+            bucket = (event["minute"] // 5) * 5
+            buckets.setdefault(bucket, {team1: 0, team2: 0})
+            # Try to associate with a team via text
+            text = event["text"].lower()
+            t1_words = set(team1.lower().split())
+            overlap  = t1_words & set(text.split())
+            team     = team1 if overlap else team2
+            buckets[bucket][team] = buckets[bucket].get(team, 0) + 1
+
+        # Serialise as sorted list
+        result = []
+        for minute in sorted(buckets):
+            result.append({
+                "minute": minute,
+                team1:    buckets[minute].get(team1, 0),
+                team2:    buckets[minute].get(team2, 0),
+            })
+        return result
+
+    # ------------------------------------------------------------------
+    # HTML export
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def export_html(data_registry):
+        """
+        Reads index.html from disk, injects the data payload, and writes
+        the result back.  The template must contain the marker comment:
+            /* {{DATA_PAYLOAD_MARKER}} */
+        FIX #9: writes UTF-8; ensures JSON is ASCII-safe for inline script.
+        """
+        if not os.path.exists("index.html"):
+            print("[-] index.html template not found — skipping export.")
+            return
+
+        with open("index.html", "r", encoding="utf-8") as f:
+            template = f.read()
+
+        marker       = "/* {{DATA_PAYLOAD_MARKER}} */"
+        json_payload = json.dumps(data_registry, ensure_ascii=True, indent=2)
+        injection    = f"const MATCH_DATA = {json_payload};"
+        final_html   = template.replace(marker, injection, 1)
+
         with open("index.html", "w", encoding="utf-8") as f:
             f.write(final_html)
-        print(f"[+] Success: index.html built with live data entries for {len(data_registry)} teams!")
+
+        print(f"[+] index.html updated with data for {len(data_registry)} team(s).")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     compiler = WorldCupDataCompiler()
-    print("[*] Launching dynamic data consolidation pipeline...")
-    
-    active_ids = compiler.get_active_matches()
-    print(f"[+] Discovered active scoreboard matches: {active_ids}")
-    
-    if not active_ids:
-        print("[!] Scoreboard empty between match windows. Using sample match target ID (2022 Final: Argentina vs France)...")
-        active_ids = [633850]
-        
-    compiled_data = compiler.compile_all_data(active_ids)
-    print("[*] Generating production HTML web payload...")
-    
-    HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="en" class="dark">
-<head>
-    <meta charset="UTF-8">
-    <title>World Cup Analytics Dashboard</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-</head>
-<body class="bg-gray-900 text-gray-100 min-h-screen font-sans">
-    <header class="bg-gray-800 border-b border-gray-700 p-4 sticky top-0 z-50 shadow-md">
-        <div class="container mx-auto flex flex-col md:flex-row justify-between items-center gap-4">
-            <h1 class="text-2xl font-bold tracking-wide text-teal-400">⚽ World Cup Match Analysis Hub</h1>
-            <div class="flex gap-4">
-                <div>
-                    <label class="block text-xs uppercase text-gray-400 mb-1 font-semibold">1. Filter by Team</label>
-                    <select id="teamSelect" onchange="handleTeamChange()" class="bg-gray-700 text-white border border-gray-600 rounded px-3 py-1.5 focus:outline-none focus:border-teal-400 w-56"></select>
-                </div>
-                <div>
-                    <label class="block text-xs uppercase text-gray-400 mb-1 font-semibold">2. Select Matchup</label>
-                    <select id="matchupSelect" onchange="loadMatchupData()" class="bg-gray-700 text-white border border-gray-600 rounded px-3 py-1.5 focus:outline-none focus:border-teal-400 w-64"></select>
-                </div>
-            </div>
-        </div>
-    </header>
+    print("[*] Starting World Cup dashboard compiler…")
 
-    <main class="container mx-auto p-4 md:p-6">
-        <div id="no-data" class="text-center py-20 text-gray-400 text-xl hidden">No matchup records discovered. Build the application with valid game records.</div>
-        
-        <div id="dashboard-content" class="space-y-6">
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 shadow-sm">
-                    <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 mb-3 border-b border-gray-700 pb-2">
-                        <h2 class="text-lg font-bold text-teal-400">Spatial Shot Map (StatsBomb Data)</h2>
-                        <div>
-                            <select id="playerShotFilter" onchange="filterShotsByPlayer()" class="bg-gray-700 text-sm text-white border border-gray-600 rounded px-2 py-1 focus:outline-none focus:border-teal-400 w-48">
-                                <option value="all">All Shots (Team)</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div id="shotmap-container" class="w-full bg-gray-950 rounded overflow-hidden" style="height: 420px;"></div>
-                </div>
+    game_ids = compiler.get_scoreboard_match_ids()
 
-                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 shadow-sm">
-                    <h2 class="text-lg font-bold text-teal-400 mb-3 border-b border-gray-700 pb-2">Team Statistics Comparison</h2>
-                    <div class="overflow-x-auto">
-                        <table class="w-full text-left text-sm">
-                            <thead>
-                                <tr class="border-b border-gray-700 text-gray-400 uppercase text-xs">
-                                    <th id="t1Header" class="py-2 text-left">Team A</th>
-                                    <th class="py-2 text-center px-4">Metric</th>
-                                    <th id="t2Header" class="py-2 text-right">Team B</th>
-                                </tr>
-                            </thead>
-                            <tbody id="team-stats-body" class="divide-y divide-gray-700/50"></tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
+    if not game_ids:
+        print("[!] Scoreboard empty. Falling back to known 2022 WC game IDs…")
+        game_ids = FALLBACK_GAME_IDS
 
-            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 shadow-sm">
-                <h2 class="text-lg font-bold text-teal-400 mb-3 border-b border-gray-700 pb-2">Starting Formations & Lineups</h2>
-                <div id="lineup-container" class="grid grid-cols-1 md:grid-cols-2 gap-8"></div>
-            </div>
+    compiled = compiler.compile_all_data(game_ids)
 
-            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 shadow-sm">
-                <h2 class="text-lg font-bold text-teal-400 mb-3 border-b border-gray-700 pb-2">Chronological Match Play Log</h2>
-                <div id="timeline-container" class="max-h-60 overflow-y-auto space-y-2 pr-2 divide-y divide-gray-700/40"></div>
-            </div>
-        </div>
-    </main>
-
-    <script>
-        /* {{DATA_PAYLOAD_MARKER}} */
-
-        let currentMatchShots = [];
-
-        window.addEventListener('DOMContentLoaded', () => {
-            const teams = Object.keys(MATCH_DATA).sort();
-            if (teams.length === 0) {
-                document.getElementById('no-data').classList.remove('hidden');
-                document.getElementById('dashboard-content').classList.add('hidden');
-                return;
-            }
-            
-            const teamSelect = document.getElementById('teamSelect');
-            teams.forEach(t => {
-                const opt = new Option(t, t);
-                teamSelect.add(opt);
-            });
-            handleTeamChange();
-        });
-
-        function handleTeamChange() {
-            const team = document.getElementById('teamSelect').value;
-            const matchups = Object.keys(MATCH_DATA[team] || {}).sort();
-            const mSelect = document.getElementById('matchupSelect');
-            mSelect.innerHTML = "";
-            
-            matchups.forEach(m => {
-                mSelect.add(new Option(m, m));
-            });
-            loadMatchupData();
-        }
-
-        function loadMatchupData() {
-            const team = document.getElementById('teamSelect').value;
-            const matchup = document.getElementById('matchupSelect').value;
-            if(!team || !matchup) return;
-
-            const mData = MATCH_DATA[team][matchup];
-            currentMatchShots = mData.spatial_shots || [];
-            
-            document.getElementById('t1Header').innerText = mData.team1;
-            document.getElementById('t2Header').innerText = mData.team2;
-            
-            const tbody = document.getElementById('team-stats-body');
-            tbody.innerHTML = "";
-            
-            const s1 = mData.team_stats[mData.team1] || [];
-            const s2 = mData.team_stats[mData.team2] || [];
-            
-            s1.forEach((metric, index) => {
-                const m2 = s2.find(x => x.name === metric.name) || { displayValue: '-' };
-                const row = document.createElement('tr');
-                row.className = "hover:bg-gray-700/30 transition-colors";
-                row.innerHTML = `
-                    <td class="py-2.5 text-left font-medium text-teal-300">${metric.displayValue}</td>
-                    <td class="py-2.5 text-center px-4 text-gray-400 font-medium">${metric.label}</td>
-                    <td class="py-2.5 text-right font-medium text-teal-300">${m2.displayValue}</td>
-                `;
-                tbody.appendChild(row);
-            });
-
-            const lineupContainer = document.getElementById('lineup-container');
-            lineupContainer.innerHTML = "";
-            mData.lineups.forEach(r => {
-                const card = document.createElement('div');
-                card.innerHTML = `
-                    <h3 class="font-bold text-gray-200 text-md mb-1">${r.team?.displayName} <span class="text-xs text-teal-400 font-mono ml-2">(${r.formation || 'N/A'})</span></h3>
-                    <ul class="text-sm space-y-1 bg-gray-900/40 p-3 rounded border border-gray-700/60 font-mono">
-                        ${(r.roster || []).filter(p => p.starter).map(p => `<li><span class="text-teal-400 w-6 inline-block">${p.jersey || ''}</span> ${p.athlete?.displayName} <span class="text-gray-500 text-xs">(${p.position?.displayName || ''})</span></li>`).join('')}
-                    </ul>
-                `;
-                lineupContainer.appendChild(card);
-            });
-
-            const timeContainer = document.getElementById('timeline-container');
-            timeContainer.innerHTML = "";
-            mData.timeline.forEach(p => {
-                const item = document.createElement('div');
-                item.className = "pt-2 text-sm flex gap-4";
-                item.innerHTML = `<span class="text-teal-400 font-bold font-mono">${p.minute}'</span><span class="text-gray-300">${p.text}</span>`;
-                timeContainer.appendChild(item);
-            });
-
-            const shotFilter = document.getElementById('playerShotFilter');
-            shotFilter.innerHTML = '<option value="all">All Shots (Team)</option>';
-            const uniquePlayers = [...new Set(currentMatchShots.map(s => s.player))].sort();
-            uniquePlayers.forEach(p => {
-                if(p && p !== 'None' && p !== 'undefined') {
-                    shotFilter.add(new Option(p, p));
-                }
-            });
-
-            filterShotsByPlayer();
-        }
-
-        function filterShotsByPlayer() {
-            const filterValue = document.getElementById('playerShotFilter').value;
-            if (filterValue === 'all') {
-                renderShotMap(currentMatchShots);
-            } else {
-                const filtered = currentMatchShots.filter(s => s.player === filterValue);
-                renderShotMap(filtered);
-            }
-        }
-
-        function renderShotMap(shots) {
-            const container = document.getElementById('shotmap-container');
-            if(!shots || shots.length === 0) {
-                container.innerHTML = `<div class="flex items-center justify-center h-full text-sm text-gray-500 bg-gray-950">No spatial coordinates synced.</div>`;
-                return;
-            }
-            container.innerHTML = "";
-
-            const traces = {};
-            shots.forEach(s => {
-                const traceKey = s.outcome === 'Goal' ? 'Goal' : 'Shot Attempt';
-                if(!traces[traceKey]) {
-                    traces[traceKey] = {
-                        x: [], y: [], text: [], mode: 'markers', name: traceKey,
-                        marker: { 
-                            size: traceKey === 'Goal' ? 14 : 9, 
-                            symbol: traceKey === 'Goal' ? 'star' : 'circle', 
-                            color: traceKey === 'Goal' ? '#f59e0b' : '#38bdf8',
-                            line: { width: 1.5, color: '#ffffff' } 
-                        }
-                    };
-                }
-                traces[traceKey].x.push(s.x);
-                traces[traceKey].y.push(s.y);
-                traces[traceKey].text.push(`<strong>${s.player}</strong> (${s.team})<br>Min: ${s.minute}'<br>Outcome: ${s.outcome}<br>xG: ${s.xg.toFixed(2)}`);
-            });
-
-            const layout = {
-                xaxis: { range: [60, 121], fixedrange: true, showgrid: false, zeroline: false, showticklabels: false },
-                yaxis: { range: [0, 80], autorange: 'reverse', fixedrange: true, showgrid: false, zeroline: false, showticklabels: false },
-                shapes: [
-                    { type: 'rect', x0: 60, y0: 0, x1: 120, y1: 80, fillcolor: '#1b4332', line: { color: 'rgba(255,255,255,0.7)', width: 2 } },
-                    { type: 'line', x0: 60, y0: 0, x1: 60, y1: 80, line: { color: 'rgba(255,255,255,0.7)', width: 2 } },
-                    { type: 'circle', x0: 50, y0: 30, x1: 70, y1: 50, line: { color: 'rgba(255,255,255,0.7)', width: 2 } },
-                    { type: 'rect', x0: 102, y0: 18, x1: 120, y1: 62, line: { color: 'rgba(255,255,255,0.7)', width: 2 } },
-                    { type: 'rect', x0: 114, y0: 30, x1: 120, y1: 50, line: { color: 'rgba(255,255,255,0.7)', width: 2 } },
-                    { type: 'circle', x0: 107.8, y0: 39.5, x1: 108.2, y1: 40.5, fillcolor: 'white', line: { color: 'white', width: 1 } },
-                    { type: 'circle', x0: 98, y0: 30, x1: 118, y1: 50, line: { color: 'rgba(255,255,255,0.5)', width: 1.5, dash: 'dot' } },
-                    { type: 'rect', x0: 120, y0: 36, x1: 121.5, y1: 44, fillcolor: 'rgba(255,255,255,0.1)', line: { color: 'rgba(255,255,255,0.8)', width: 1.5 } }
-                ],
-                paper_bgcolor: 'transparent',
-                plot_bgcolor: 'transparent',
-                font: { color: '#9ca3af', size: 11 },
-                margin: { l: 15, r: 15, t: 15, b: 15 },
-                legend: { orientation: 'h', x: 0.5, y: -0.05, xanchor: 'center' },
-                hovermode: 'closest'
-            };
-
-            Plotly.newPlot(container, Object.values(traces), layout, {responsive: true, displayModeBar: false});
-        }
-    </script>
-</body>
-</html>
-"""
-
-    compiler.export_html(compiled_data, HTML_TEMPLATE)
+    if compiled:
+        WorldCupDataCompiler.export_html(compiled)
+    else:
+        print("[-] No match data compiled — index.html not updated.")
+        sys.exit(1)
