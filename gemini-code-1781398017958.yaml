@@ -1,0 +1,56 @@
+name: Auto-Update World Cup Dashboard
+
+on:
+  schedule:
+    # Runs automatically every day at midnight UTC
+    # You can adjust this cron schedule string to run more frequently (e.g., hourly during active matches)
+    - cron: '0 0 * * *'
+  
+  # Allows you to manually trigger the workflow from the GitHub Actions tab anytime
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    # Crucial: Give the default GITHUB_TOKEN write access to commit the updated HTML back to the repository
+    permissions:
+      contents: write
+
+    steps:
+    # Step 1: Clone your repository into the runner's workspace
+    - name: Check out repository
+      uses: actions/checkout@v4
+
+    # Step 2: Provision a clean Python 3.11 environment
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip' # Speeds up subsequent runs by caching dependencies
+
+    # Step 3: Install necessary library dependencies
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests pandas statsbombpy
+
+    # Step 4: Execute your scraping and compiling orchestrator script
+    - name: Run Dashboard Compiler
+      run: python build_dashboard.py
+
+    # Step 5: Check for variations and push the newly generated index.html back to the branch
+    - name: Commit and Push changes
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        
+        # Check if index.html was altered by the Python compilation script
+        if git status --porcelain | grep -q "index.html"; then
+          echo "[+] Changes detected in index.html. Committing updates..."
+          git add index.html
+          git commit -m "ci: auto-update match data footprint [skip ci]"
+          git push origin main
+        else
+          echo "[-] No match variations or historical changes found. Skipping push."
+        fi

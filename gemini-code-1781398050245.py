@@ -1,0 +1,329 @@
+import requests
+import json
+import os
+from statsbombpy import sb
+
+class WorldCupDataCompiler:
+    def __init__(self, tournament_id=43, season_id=106):
+        # Default target set to World Cup open-data footprints
+        self.espn_base = "https://site.api.espn.com/apis/site/v2/sports/soccer/all"
+        self.tournament_id = tournament_id
+        self.season_id = season_id
+
+    def get_espn_match_details(self, game_id):
+        """Pulls comprehensive stats, lineups, and plays directly from ESPN API."""
+        url = f"{self.espn_base}/summary?event={game_id}"
+        try:
+            res = requests.get(url)
+            return res.json()
+        except Exception as e:
+            print(f"[-] Error fetching ESPN game {game_id}: {e}")
+            return None
+
+    def fetch_statsbomb_spatial_shots(self, team1, team2):
+        """Locates specific match pairings within StatsBomb and extracts (x,y) shot matrices."""
+        try:
+            matches = sb.matches(competition_id=self.tournament_id, season_id=self.season_id)
+            match_id = None
+            
+            # Simple normalizer matching names between datasets
+            t1, t2 = team1.lower(), team2.lower()
+            for _, row in matches.iterrows():
+                home, away = row['home_team'].lower(), row['away_team'].lower()
+                if (t1 in home or home in t1 or t1 in away or away in t1) and \
+                   (t2 in home or home in t2 or t2 in away or away in t2):
+                    match_id = row['match_id']
+                    break
+            
+            if not match_id:
+                return []
+
+            events = sb.events(match_id=match_id)
+            if 'type' not in events.columns or 'Shot' not in events['type'].unique():
+                return []
+                
+            shots_df = events[events['type'] == 'Shot']
+            shots_log = []
+            for _, row in shots_df.iterrows():
+                loc = row.get('location', [0, 0])
+                shots_log.append({
+                    "minute": int(row.get('minute', 0)),
+                    "team": str(row.get('team', '')),
+                    "player": str(row.get('player', '')),
+                    "x": float(loc[0]) if len(loc) > 0 else 0.0,
+                    "y": float(loc[1]) if len(loc) > 1 else 0.0,
+                    "outcome": str(row.get('shot_outcome', 'Unknown')),
+                    "xg": float(row.get('shot_statsbomb_xg', 0.0))
+                })
+            return shots_log
+        except Exception as e:
+            print(f"[-] StatsBomb mapping unavailable for {team1} vs {team2}: {e}")
+            return []
+
+    def compile_all_data(self, game_ids):
+        """Iterates over specified game schedules to form a team-indexed mapping layout."""
+        dashboard_registry = {}
+
+        for gid in game_ids:
+            print(f"[+] Processing Match ID: {gid}")
+            raw = self.get_espn_match_details(gid)
+            if not raw: continue
+            
+            header = raw.get('header', {})
+            competitors = header.get('competitors', [])
+            if len(competitors) < 2: continue
+            
+            # Match metadata
+            t1_name = competitors[1].get('team', {}).get('displayName')
+            t2_name = competitors[0].get('team', {}).get('displayName')
+            matchup_title = f"{t1_name} vs {t2_name}"
+            
+            # Extract structures
+            boxscore = raw.get('boxscore', {})
+            teams_payload = {t.get('team', {}).get('displayName'): t.get('statistics', []) for t in boxscore.get('teams', [])}
+            rosters = raw.get('rosters', [])
+            plays = raw.get('plays', [])
+            
+            # Integrate Spatial Coordinates via StatsBomb
+            spatial_shots = self.fetch_statsbomb_spatial_shots(t1_name, t2_name)
+
+            game_data = {
+                "matchup": matchup_title,
+                "team1": t1_name,
+                "team2": t2_name,
+                "team_stats": teams_payload,
+                "lineups": rosters,
+                "player_stats": boxscore.get('players', []),
+                "timeline": [{"minute": p.get('clock', {}).get('value'), "text": p.get('text')} for p in plays if p.get('text')],
+                "spatial_shots": spatial_shots
+            }
+
+            # Map the record by both teams to meet navigation requirements
+            for team in [t1_name, t2_name]:
+                if team not in dashboard_registry:
+                    dashboard_registry[team] = {}
+                dashboard_registry[team][matchup_title] = game_data
+
+        return dashboard_registry
+
+    def export_html(self, data_registry, template_string):
+        """Injects compiled match data object directly into the web layout blueprint."""
+        json_payload = json.dumps(data_registry, indent=2)
+        final_html = template_string.replace("/* {{DATA_PAYLOAD_MARKER}} */", f"const MATCH_DATA = {json_payload};")
+        
+        with open("index.html", "w", encoding="utf-8") as f:
+            f.write(final_html)
+        print("[+] Success: index.html has been built!")
+
+# HTML/JS layout architecture definitions
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <title>World Cup Analytics Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen font-sans">
+    <header class="bg-gray-800 border-b border-gray-700 p-4 sticky top-0 z-50 shadow-md">
+        <div class="container mx-auto flex flex-col md:flex-row justify-between items-center gap-4">
+            <h1 class="text-2xl font-bold tracking-wide text-teal-400">⚽ World Cup Match Analysis Hub</h1>
+            <div class="flex gap-4">
+                <div>
+                    <label class="block text-xs uppercase text-gray-400 mb-1 font-semibold">1. Filter by Team</label>
+                    <select id="teamSelect" onchange="handleTeamChange()" class="bg-gray-700 text-white border border-gray-600 rounded px-3 py-1.5 focus:outline-none focus:border-teal-400 w-56"></select>
+                </div>
+                <div>
+                    <label class="block text-xs uppercase text-gray-400 mb-1 font-semibold">2. Select Matchup</label>
+                    <select id="matchupSelect" onchange="loadMatchupData()" class="bg-gray-700 text-white border border-gray-600 rounded px-3 py-1.5 focus:outline-none focus:border-teal-400 w-64"></select>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <main class="container mx-auto p-4 md:p-6">
+        <div id="no-data" class="text-center py-20 text-gray-400 text-xl hidden">No matchup records discovered. Build the application with valid game records.</div>
+        
+        <div id="dashboard-content" class="space-y-6">
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 shadow-sm">
+                    <h2 class="text-lg font-bold text-teal-400 mb-3 border-b border-gray-700 pb-2">Spatial Shot Map (StatsBomb Data)</h2>
+                    <div id="shotmap-container" class="w-full bg-gray-950 rounded overflow-hidden" style="height: 420px;"></div>
+                </div>
+
+                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 shadow-sm">
+                    <h2 class="text-lg font-bold text-teal-400 mb-3 border-b border-gray-700 pb-2">Team Statistics Comparison</h2>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left text-sm">
+                            <thead>
+                                <tr class="border-b border-gray-700 text-gray-400 uppercase text-xs">
+                                    <th id="t1Header" class="py-2 text-left">Team A</th>
+                                    <th class="py-2 text-center px-4">Metric</th>
+                                    <th id="t2Header" class="py-2 text-right">Team B</th>
+                                </tr>
+                            </thead>
+                            <tbody id="team-stats-body" class="divide-y divide-gray-700/50"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 shadow-sm">
+                <h2 class="text-lg font-bold text-teal-400 mb-3 border-b border-gray-700 pb-2">Starting Formations & Lineups</h2>
+                <div id="lineup-container" class="grid grid-cols-1 md:grid-cols-2 gap-8"></div>
+            </div>
+
+            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 shadow-sm">
+                <h2 class="text-lg font-bold text-teal-400 mb-3 border-b border-gray-700 pb-2">Chronological Match Play Log</h2>
+                <div id="timeline-container" class="max-h-60 overflow-y-auto space-y-2 pr-2 divide-y divide-gray-700/40"></div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        /* {{DATA_PAYLOAD_MARKER}} */
+
+        window.addEventListener('DOMContentLoaded', () => {
+            const teams = Object.keys(MATCH_DATA).sort();
+            if (teams.length === 0) {
+                document.getElementById('no-data').classList.remove('hidden');
+                document.getElementById('dashboard-content').classList.add('hidden');
+                return;
+            }
+            
+            const teamSelect = document.getElementById('teamSelect');
+            teams.forEach(t => {
+                const opt = new Option(t, t);
+                teamSelect.add(opt);
+            });
+            handleTeamChange();
+        });
+
+        function handleTeamChange() {
+            const team = document.getElementById('teamSelect').value;
+            const matchups = Object.keys(MATCH_DATA[team] || {}).sort();
+            const mSelect = document.getElementById('matchupSelect');
+            mSelect.innerHTML = "";
+            
+            matchups.forEach(m => {
+                mSelect.add(new Option(m, m));
+            });
+            loadMatchupData();
+        }
+
+        function loadMatchupData() {
+            const team = document.getElementById('teamSelect').value;
+            const matchup = document.getElementById('matchupSelect').value;
+            if(!team || !matchup) return;
+
+            const mData = MATCH_DATA[team][matchup];
+            
+            // Populate Team Stat Rows
+            document.getElementById('t1Header').innerText = mData.team1;
+            document.getElementById('t2Header').innerText = mData.team2;
+            
+            const tbody = document.getElementById('team-stats-body');
+            tbody.innerHTML = "";
+            
+            const s1 = mData.team_stats[mData.team1] || [];
+            const s2 = mData.team_stats[mData.team2] || [];
+            
+            s1.forEach((metric, index) => {
+                const m2 = s2.find(x => x.name === metric.name) || { displayValue: '-' };
+                const row = document.createElement('tr');
+                row.className = "hover:bg-gray-700/30 transition-colors";
+                row.innerHTML = `
+                    <td class="py-2.5 text-left font-medium text-teal-300">${metric.displayValue}</td>
+                    <td class="py-2.5 text-center px-4 text-gray-400 font-medium">${metric.label}</td>
+                    <td class="py-2.5 text-right font-medium text-teal-300">${m2.displayValue}</td>
+                `;
+                tbody.appendChild(row);
+            });
+
+            // Populate Lineup cards
+            const lineupContainer = document.getElementById('lineup-container');
+            lineupContainer.innerHTML = "";
+            mData.lineups.forEach(r => {
+                const card = document.createElement('div');
+                card.innerHTML = `
+                    <h3 class="font-bold text-gray-200 text-md mb-1">${r.team?.displayName} <span class="text-xs text-teal-400 font-mono ml-2">(${r.formation || 'N/A'})</span></h3>
+                    <ul class="text-sm space-y-1 bg-gray-900/40 p-3 rounded border border-gray-700/60 font-mono">
+                        ${(r.roster || []).filter(p => p.starter).map(p => `<li><span class="text-teal-400 w-6 inline-block">${p.jersey || ''}</span> ${p.athlete?.displayName} <span class="text-gray-500 text-xs">(${p.position?.displayName || ''})</span></li>`).join('')}
+                    </ul>
+                `;
+                lineupContainer.appendChild(card);
+            });
+
+            // Populate Play Logs
+            const timeContainer = document.getElementById('timeline-container');
+            timeContainer.innerHTML = "";
+            mData.timeline.forEach(p => {
+                const item = document.createElement('div');
+                item.className = "pt-2 text-sm flex gap-4";
+                item.innerHTML = `<span class="text-teal-400 font-bold font-mono">${p.minute}'</span><span class="text-gray-300">${p.text}</span>`;
+                timeContainer.appendChild(item);
+            });
+
+            // Map StatsBomb Coordinates via Plotly.js
+            renderShotMap(mData.spatial_shots);
+        }
+
+        function renderShotMap(shots) {
+            const container = document.getElementById('shotmap-container');
+            if(!shots || shots.length === 0) {
+                container.innerHTML = `<div class="flex items-center justify-center h-full text-sm text-gray-500">No spatial coordinates synced from open data feeds for this matchup.</div>`;
+                return;
+            }
+            container.innerHTML = "";
+
+            const traces = {};
+            shots.forEach(s => {
+                const traceKey = s.outcome === 'Goal' ? 'Goal' : 'Shot Attempt';
+                if(!traces[traceKey]) {
+                    traces[traceKey] = {
+                        x: [], y: [], text: [], mode: 'markers', name: traceKey,
+                        marker: { size: traceKey === 'Goal' ? 12 : 8, symbol: traceKey === 'Goal' ? 'star' : 'circle', line: {width: 1, color: 'white'} }
+                    };
+                }
+                // StatsBomb attacking directions normalized length (60-120 yards represents attacking half)
+                traces[traceKey].x.push(s.x);
+                traces[traceKey].y.push(s.y);
+                traces[traceKey].text.push(`<strong>${s.player}</strong> (${s.team})<br>Min: ${s.minute}'<br>Outcome: ${s.outcome}<br>xG: ${s.xg.toFixed(2)}`);
+            });
+
+            const layout = {
+                xaxis: { range: [60, 122], title: 'Pitch Length (Yards)', fixedrange: true, gridcolor: '#2d3748' },
+                yaxis: { range: [0, 80], title: 'Pitch Width (Yards)', autorange: 'reverse', fixedrange: true, gridcolor: '#2d3748' },
+                shapes: [
+                    // Penalty Area Boundaries Box
+                    { type: 'rect', x0: 102, y0: 18, x1: 120, y1: 62, line: { color: 'rgba(255,255,255,0.6)', width: 1.5 } },
+                    // Goal Box / 6-Yard Box Area
+                    { type: 'rect', x0: 114, y0: 30, x1: 120, y1: 50, line: { color: 'rgba(255,255,255,0.6)', width: 1.5 } },
+                    // Net Structure Target Frame
+                    { type: 'rect', x0: 120, y0: 36, x1: 122, y1: 44, fillcolor: 'rgba(20,184,166,0.2)', line: { color: '#14b8a6', width: 1.5 } }
+                ],
+                paper_bgcolor: 'transparent',
+                plot_bgcolor: '#111827',
+                font: { color: '#9ca3af', size: 11 },
+                margin: { l: 45, r: 25, t: 25, b: 40 },
+                legend: { orientation: 'h', x: 0.5, y: -0.2, xanchor: 'center' }
+            };
+
+            Plotly.newPlot(container, Object.values(traces), layout, {responsive: true, displayModeBar: false});
+        }
+    </script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    # Supply your specific list of ESPN Game IDs to build out your historic repository
+    # Example provided uses game ID 760417 (Paraguay vs USA match archetype)
+    target_games = [760417] 
+    
+    compiler = WorldCupDataCompiler()
+    print("[*] Launching data consolidation pipeline...")
+    compiled_data = compiler.compile_all_data(target_games)
+    
+    print("[*] Generating production HTML web payload...")
+    compiler.export_html(compiled_data, HTML_TEMPLATE)
