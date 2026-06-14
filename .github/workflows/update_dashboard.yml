@@ -2,55 +2,60 @@ name: Auto-Update World Cup Dashboard
 
 on:
   schedule:
-    # Runs automatically every day at midnight UTC
-    # You can adjust this cron schedule string to run more frequently (e.g., hourly during active matches)
-    - cron: '0 0 * * *'
-  
-  # Allows you to manually trigger the workflow from the GitHub Actions tab anytime
+    # Runs every 3 hours during likely active tournament windows (UTC).
+    # Adjust to '0 * * * *' (hourly) during the knockout stage.
+    - cron: '0 */3 * * *'
+
+  # Lets you manually trigger from the GitHub Actions tab at any time.
   workflow_dispatch:
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
-    # Crucial: Give the default GITHUB_TOKEN write access to commit the updated HTML back to the repository
+    # Give the default GITHUB_TOKEN write access so it can push index.html back.
     permissions:
       contents: write
 
     steps:
-    # Step 1: Clone your repository into the runner's workspace
-    - name: Check out repository
-      uses: actions/checkout@v4
+      # ── 1. Check out the repository ────────────────────────────────────
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-    # Step 2: Provision a clean Python 3.11 environment
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-        cache: 'pip' # Speeds up subsequent runs by caching dependencies
+      # ── 2. Set up Python ───────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
 
-    # Step 3: Install necessary library dependencies
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install requests pandas statsbombpy
+      # ── 3. Install dependencies ─────────────────────────────────────────
+      # statsbombpy is optional — the script degrades gracefully without it.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas
+          pip install statsbombpy || echo "statsbombpy unavailable — using ESPN fallback"
 
-    # Step 4: Execute your scraping and compiling orchestrator script
-    - name: Run Dashboard Compiler
-      run: python build_dashboard.py
+      # ── 4. Run the dashboard compiler ──────────────────────────────────
+      # The script reads index.html (the template), injects MATCH_DATA, and
+      # writes index.html back in place.  It exits 1 if no data is compiled,
+      # which will surface as a failed Action run for easy debugging.
+      - name: Run Dashboard Compiler
+        run: python build_dashboard.py
 
-    # Step 5: Check for variations and push the newly generated index.html back to the branch
-    - name: Commit and Push changes
-      run: |
-        git config --local user.email "github-actions[bot]@users.noreply.github.com"
-        git config --local user.name "github-actions[bot]"
-        
-        # Check if index.html was altered by the Python compilation script
-        if git status --porcelain | grep -q "index.html"; then
-          echo "[+] Changes detected in index.html. Committing updates..."
-          git add index.html
-          git commit -m "ci: auto-update match data footprint [skip ci]"
-          git push origin main
-        else
-          echo "[-] No match variations or historical changes found. Skipping push."
-        fi
+      # ── 5. Commit & push if index.html changed ─────────────────────────
+      # [skip ci] on the commit message prevents this push from re-triggering
+      # the workflow (avoids infinite loops).
+      - name: Commit and push updated dashboard
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name  "github-actions[bot]"
+
+          if git diff --quiet index.html; then
+            echo "No changes to index.html — nothing to commit."
+          else
+            git add index.html
+            git commit -m "ci: auto-update match data [skip ci]"
+            git push origin HEAD
+          fi
