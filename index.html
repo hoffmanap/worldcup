@@ -29,14 +29,7 @@
         <div id="dashboard-content" class="space-y-6">
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 shadow-sm">
-                    <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 mb-3 border-b border-gray-700 pb-2">
-                        <h2 class="text-lg font-bold text-teal-400">Spatial Shot Map (StatsBomb Data)</h2>
-                        <div>
-                            <select id="playerShotFilter" onchange="filterShotsByPlayer()" class="bg-gray-700 text-sm text-white border border-gray-600 rounded px-2 py-1 focus:outline-none focus:border-teal-400 w-48">
-                                <option value="all">All Shots (Team)</option>
-                            </select>
-                        </div>
-                    </div>
+                    <h2 class="text-lg font-bold text-teal-400 mb-3 border-b border-gray-700 pb-2">Spatial Shot Map (StatsBomb Data)</h2>
                     <div id="shotmap-container" class="w-full bg-gray-950 rounded overflow-hidden" style="height: 420px;"></div>
                 </div>
 
@@ -70,9 +63,7 @@
     </main>
 
     <script>
-        /* {{DATA_PAYLOAD_MARKER}} */
-
-        let currentMatchShots = []; // Global cache holding spatial shot events for active filtering
+        const MATCH_DATA = {};
 
         window.addEventListener('DOMContentLoaded', () => {
             const teams = Object.keys(MATCH_DATA).sort();
@@ -108,7 +99,6 @@
             if(!team || !matchup) return;
 
             const mData = MATCH_DATA[team][matchup];
-            currentMatchShots = mData.spatial_shots || [];
             
             // Populate Team Stat Rows
             document.getElementById('t1Header').innerText = mData.team1;
@@ -156,34 +146,14 @@
                 timeContainer.appendChild(item);
             });
 
-            // Rebuild Player Shot Filtering Submenu
-            const shotFilter = document.getElementById('playerShotFilter');
-            shotFilter.innerHTML = '<option value="all">All Shots (Team)</option>';
-            const uniquePlayers = [...new Set(currentMatchShots.map(s => s.player))].sort();
-            uniquePlayers.forEach(p => {
-                if(p && p !== 'None' && p !== 'undefined') {
-                    shotFilter.add(new Option(p, p));
-                }
-            });
-
-            // Render default view containing cumulative squad shots
-            filterShotsByPlayer();
-        }
-
-        function filterShotsByPlayer() {
-            const filterValue = document.getElementById('playerShotFilter').value;
-            if (filterValue === 'all') {
-                renderShotMap(currentMatchShots);
-            } else {
-                const filtered = currentMatchShots.filter(s => s.player === filterValue);
-                renderShotMap(filtered);
-            }
+            // Map StatsBomb Coordinates via Plotly.js
+            renderShotMap(mData.spatial_shots);
         }
 
         function renderShotMap(shots) {
             const container = document.getElementById('shotmap-container');
             if(!shots || shots.length === 0) {
-                container.innerHTML = `<div class="flex items-center justify-center h-full text-sm text-gray-500 bg-gray-950">No spatial coordinates synced for this selection.</div>`;
+                container.innerHTML = `<div class="flex items-center justify-center h-full text-sm text-gray-500">No spatial coordinates synced from open data feeds for this matchup.</div>`;
                 return;
             }
             container.innerHTML = "";
@@ -194,47 +164,31 @@
                 if(!traces[traceKey]) {
                     traces[traceKey] = {
                         x: [], y: [], text: [], mode: 'markers', name: traceKey,
-                        marker: { 
-                            size: traceKey === 'Goal' ? 14 : 9, 
-                            symbol: traceKey === 'Goal' ? 'star' : 'circle', 
-                            color: traceKey === 'Goal' ? '#f59e0b' : '#38bdf8',
-                            line: { width: 1.5, color: '#ffffff' } 
-                        }
+                        marker: { size: traceKey === 'Goal' ? 12 : 8, symbol: traceKey === 'Goal' ? 'star' : 'circle', line: {width: 1, color: 'white'} }
                     };
                 }
+                // StatsBomb attacking directions normalized length (60-120 yards represents attacking half)
                 traces[traceKey].x.push(s.x);
                 traces[traceKey].y.push(s.y);
                 traces[traceKey].text.push(`<strong>${s.player}</strong> (${s.team})<br>Min: ${s.minute}'<br>Outcome: ${s.outcome}<br>xG: ${s.xg.toFixed(2)}`);
             });
 
-            // Generating standard technical soccer pitch parameters via explicit SVG layer matrices
             const layout = {
-                xaxis: { range: [60, 121], title: 'Pitch Length (Attacking Half Yards)', fixedrange: true, showgrid: false, zeroline: false, showticklabels: false },
-                yaxis: { range: [0, 80], title: 'Pitch Width (Yards)', autorange: 'reverse', fixedrange: true, showgrid: false, zeroline: false, showticklabels: false },
+                xaxis: { range: [60, 122], title: 'Pitch Length (Yards)', fixedrange: true, gridcolor: '#2d3748' },
+                yaxis: { range: [0, 80], title: 'Pitch Width (Yards)', autorange: 'reverse', fixedrange: true, gridcolor: '#2d3748' },
                 shapes: [
-                    // Outer Pitch Attacking Half Boundary Green Fill
-                    { type: 'rect', x0: 60, y0: 0, x1: 120, y1: 80, fillcolor: '#1b4332', line: { color: 'rgba(255,255,255,0.7)', width: 2 } },
-                    // Halfway Line
-                    { type: 'line', x0: 60, y0: 0, x1: 60, y1: 80, line: { color: 'rgba(255,255,255,0.7)', width: 2 } },
-                    // Center Circle Rim (Radius 10 yards, centered at 60, 40)
-                    { type: 'circle', x0: 50, y0: 30, x1: 70, y1: 50, line: { color: 'rgba(255,255,255,0.7)', width: 2 } },
-                    // 18-Yard Penalty Area Box (18 yards deep, 44 yards wide centered)
-                    { type: 'rect', x0: 102, y0: 18, x1: 120, y1: 62, line: { color: 'rgba(255,255,255,0.7)', width: 2 } },
-                    // 6-Yard Box Area (6 yards deep, 20 yards wide centered)
-                    { type: 'rect', x0: 114, y0: 30, x1: 120, y1: 50, line: { color: 'rgba(255,255,255,0.7)', width: 2 } },
-                    // Penalty Spot Dot (12 yards out from Goal Line)
-                    { type: 'circle', x0: 107.8, y0: 39.5, x1: 108.2, y1: 40.5, fillcolor: 'white', line: { color: 'white', width: 1 } },
-                    // Penalty Arc / 'The D' (Radius 10 yards centered at Penalty Spot)
-                    { type: 'circle', x0: 98, y0: 30, x1: 118, y1: 50, line: { color: 'rgba(255,255,255,0.5)', width: 1.5, dash: 'dot' } },
-                    // Out of Bounds Goal Net Frame Structure (Behind the 120 line)
-                    { type: 'rect', x0: 120, y0: 36, x1: 121.5, y1: 44, fillcolor: 'rgba(255,255,255,0.1)', line: { color: 'rgba(255,255,255,0.8)', width: 1.5 } }
+                    // Penalty Area Boundaries Box
+                    { type: 'rect', x0: 102, y0: 18, x1: 120, y1: 62, line: { color: 'rgba(255,255,255,0.6)', width: 1.5 } },
+                    // Goal Box / 6-Yard Box Area
+                    { type: 'rect', x0: 114, y0: 30, x1: 120, y1: 50, line: { color: 'rgba(255,255,255,0.6)', width: 1.5 } },
+                    // Net Structure Target Frame
+                    { type: 'rect', x0: 120, y0: 36, x1: 122, y1: 44, fillcolor: 'rgba(20,184,166,0.2)', line: { color: '#14b8a6', width: 1.5 } }
                 ],
                 paper_bgcolor: 'transparent',
-                plot_bgcolor: 'transparent',
+                plot_bgcolor: '#111827',
                 font: { color: '#9ca3af', size: 11 },
-                margin: { l: 15, r: 15, t: 15, b: 15 },
-                legend: { orientation: 'h', x: 0.5, y: -0.05, xanchor: 'center' },
-                hovermode: 'closest'
+                margin: { l: 45, r: 25, t: 25, b: 40 },
+                legend: { orientation: 'h', x: 0.5, y: -0.2, xanchor: 'center' }
             };
 
             Plotly.newPlot(container, Object.values(traces), layout, {responsive: true, displayModeBar: false});
