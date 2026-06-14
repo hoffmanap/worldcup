@@ -50,9 +50,8 @@ TOURNAMENT_END   = date(2026, 7, 19)
 SB_COMPETITION_ID = 43
 SB_SEASON_ID      = 106
 
-# Hard-coded known 2026 WC ESPN game IDs as a last-resort fallback.
-# Add more as ESPN assigns them; the scraper will discover most automatically.
-SEED_GAME_IDS = [760419]
+# FIX: Changed seed ID to a string to guarantee type matching across the script.
+SEED_GAME_IDS = ["760419"]
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +99,8 @@ class WorldCupDataCompiler:
         hitting the ESPN scoreboard endpoint.  Returns a deduplicated,
         sorted list of event IDs.
         """
-        ids    = set(SEED_GAME_IDS)
+        # FIX: Force elements to strings during initial set definition.
+        ids    = set(str(gid) for gid in SEED_GAME_IDS)
         end    = min(today(), TOURNAMENT_END)
         cursor = TOURNAMENT_START
 
@@ -112,7 +112,8 @@ class WorldCupDataCompiler:
                 if r.status_code == 200:
                     for evt in r.json().get("events", []):
                         if evt.get("id"):
-                            ids.add(evt["id"])
+                            # FIX: Express explicitly as a string to avoid sorting mismatches later.
+                            ids.add(str(evt["id"]))
             except Exception as exc:
                 print(f"  [!] Scoreboard {date_str} failed: {exc}")
             cursor += timedelta(days=1)
@@ -165,9 +166,9 @@ class WorldCupDataCompiler:
     def _parse_plays(plays, team1, team2):
         """
         Convert ESPN play array into:
-          - timeline  list[dict]
-          - shots     list[dict]   (ESPN fallback, no real x/y)
-          - momentum  list[dict]   5-min shot buckets
+          - timeline     list[dict]
+          - shots        list[dict]   (ESPN fallback, no real x/y)
+          - momentum     list[dict]   5-min shot buckets
 
         FIX: team is read from play["team"]["displayName"] when present,
         NOT from fragile word-overlap on description text.
@@ -220,7 +221,7 @@ class WorldCupDataCompiler:
 
             period   = p.get("period", {}).get("number", 1)
             etype    = classify(text)
-            pteam    = play_team(p)   # may be None
+            pteam    = play_team(p)  # may be None
 
             timeline.append({
                 "minute":     minute,
@@ -396,7 +397,7 @@ class WorldCupDataCompiler:
         team_stats_merged = {
             team_name: [
                 {
-                    "name":         sname,
+                    "name":        sname,
                     "label":        v["label"],
                     "displayValue": str(round(v["team_total"], 1)),
                 }
@@ -404,7 +405,7 @@ class WorldCupDataCompiler:
             ],
             "Opponents": [
                 {
-                    "name":         sname,
+                    "name":        sname,
                     "label":        v["label"],
                     "displayValue": str(round(v["opp_total"], 1)),
                 }
