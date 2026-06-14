@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>World Cup Analytics Hub</title>
+
+  <!-- Plotly for shot map & momentum chart -->
+  <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+
+  <style>
+    /* ── Design tokens ────────────────────────────────────────────── */
+    :root {
+      --bg:        #0b0f1a;
+      --surface:   #111827;
+      --surface2:  #1a2235;
+      --border:    #253047;
+      --accent:    #38bdf8;    /* sky-400  */
+      --accent2:   #f59e0b;    /* amber (goals) */
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --goal:      #f59e0b;
+      --shot:      #38bdf8;
+      --yellow:    #fde047;
+      --red:       #f87171;
+      --sub:       #a78bfa;
+      --foul:      #94a3b8;
+      --pitch-bg:  #0d3d1f;
+      --font-ui:   'Inter', system-ui, sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Mono', ui-monospace, monospace;
+    }
+
+    /* ── Reset & base ─────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-ui);
+      font-size: 14px;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    /* ── Typography ───────────────────────────────────────────────── */
+    h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -.02em; }
+    h2 { font-size: 1rem;   font-weight: 600; color: var(--accent); }
+    h3 { font-size: .85rem; font-weight: 600; color: var(--text); }
+
+    /* ── Header ───────────────────────────────────────────────────── */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 20px;
+      position: sticky; top: 0; z-index: 100;
+      display: flex; align-items: center; gap: 24px; flex-wrap: wrap;
+    }
+    .logo {
+      display: flex; align-items: center; gap: 8px;
+    }
+    .logo-ball {
+      width: 28px; height: 28px;
+      background: radial-gradient(circle at 38% 38%, #fff 0%, #ccc 60%, #888 100%);
+      border-radius: 50%;
+      position: relative;
+      flex-shrink: 0;
+    }
+    .logo h1 { color: var(--text); }
+    .logo h1 span { color: var(--accent); }
+
+    .controls {
+      display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; margin-left: auto;
+    }
+    .ctrl-group label {
+      display: block; font-size: 10px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: .06em;
+      color: var(--muted); margin-bottom: 4px;
+    }
+    select {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 13px;
+      font-family: var(--font-ui);
+      cursor: pointer;
+      outline: none;
+      min-width: 180px;
+    }
+    select:focus { border-color: var(--accent); }
+
+    /* ── Main layout ──────────────────────────────────────────────── */
+    main { padding: 20px; max-width: 1400px; margin: 0 auto; }
+
+    #no-data {
+      text-align: center; padding: 80px 20px;
+      color: var(--muted); font-size: 1rem;
+    }
+    #no-data.hidden, .hidden { display: none !important; }
+
+    /* ── Panel grid ───────────────────────────────────────────────── */
+    .panel-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: auto auto;
+      gap: 16px;
+    }
+    @media (max-width: 900px) {
+      .panel-grid { grid-template-columns: 1fr; }
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .panel-header {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    }
+    .panel-body { padding: 16px; }
+
+    /* ── Shot map ─────────────────────────────────────────────────── */
+    #shotmap-panel { grid-column: 1; }
+    #shotmap-container {
+      width: 100%; height: 380px;
+      background: var(--pitch-bg);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    /* ── Momentum ─────────────────────────────────────────────────── */
+    #momentum-panel { grid-column: 2; }
+    #momentum-container { width: 100%; height: 380px; }
+
+    @media (max-width: 900px) {
+      #shotmap-panel, #momentum-panel { grid-column: 1; }
+    }
+
+    /* ── Team stats ───────────────────────────────────────────────── */
+    #stats-panel { grid-column: 1 / -1; }
+    .stats-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    thead th {
+      padding: 8px 12px;
+      font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
+      color: var(--muted); font-weight: 600;
+      border-bottom: 1px solid var(--border);
+    }
+    tbody tr { border-bottom: 1px solid var(--border); }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover td { background: var(--surface2); }
+    td { padding: 9px 12px; }
+    td.val { font-variant-numeric: tabular-nums; font-family: var(--font-mono); font-size: 13px; }
+    td.label { color: var(--muted); text-align: center; font-size: 12px; }
+    .t1-val { color: var(--accent); text-align: left; }
+    .t2-val { color: var(--accent2); text-align: right; }
+
+    /* ── Formations ───────────────────────────────────────────────── */
+    #lineup-panel { grid-column: 1 / -1; }
+    .lineup-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 20px;
+    }
+    .team-lineup-card h3 {
+      margin-bottom: 8px; font-size: .85rem;
+    }
+    .formation-badge {
+      display: inline-block;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 1px 7px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--accent);
+      margin-left: 6px;
+    }
+    .pitch-visual {
+      position: relative;
+      width: 100%; aspect-ratio: 3/4;
+      background: var(--pitch-bg);
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      overflow: hidden;
+      margin-bottom: 12px;
+    }
+    .pitch-line {
+      position: absolute;
+      background: rgba(255,255,255,0.18);
+    }
+    .pitch-line.h { height: 1px; left: 0; right: 0; }
+    .pitch-line.v { width: 1px; top: 0; bottom: 0; }
+    .pitch-circle {
+      position: absolute;
+      border: 1px solid rgba(255,255,255,0.18);
+      border-radius: 50%;
+    }
+    .player-dot {
+      position: absolute;
+      width: 28px; height: 28px;
+      transform: translate(-50%, -50%);
+      display: flex; flex-direction: column; align-items: center;
+      cursor: default;
+    }
+    .player-dot .dot {
+      width: 20px; height: 20px;
+      border-radius: 50%;
+      background: var(--accent);
+      border: 2px solid #fff;
+      font-size: 9px; color: #000;
+      font-weight: 700;
+      display: flex; align-items: center; justify-content: center;
+      font-family: var(--font-mono);
+    }
+    .player-dot.gk .dot { background: var(--accent2); }
+    .player-dot .pname {
+      font-size: 8px; color: #fff;
+      margin-top: 1px;
+      white-space: nowrap;
+      text-shadow: 0 0 3px #000;
+      max-width: 52px;
+      overflow: hidden; text-overflow: ellipsis;
+    }
+    .starter-list {
+      list-style: none;
+      font-size: 12px;
+    }
+    .starter-list li {
+      display: flex; align-items: center; gap: 8px;
+      padding: 5px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .starter-list li:last-child { border-bottom: none; }
+    .jersey-num {
+      font-family: var(--font-mono); font-size: 11px;
+      color: var(--accent); min-width: 18px; text-align: right;
+    }
+    .player-pos {
+      color: var(--muted); font-size: 10px;
+      margin-left: auto;
+    }
+
+    /* ── Timeline ─────────────────────────────────────────────────── */
+    #timeline-panel { grid-column: 1 / -1; }
+    .timeline-scroll {
+      max-height: 320px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+    .timeline-event {
+      display: flex; align-items: flex-start; gap: 10px;
+      padding: 8px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+      font-size: 12px;
+    }
+    .timeline-event:last-child { border-bottom: none; }
+    .t-minute {
+      font-family: var(--font-mono); font-size: 11px;
+      color: var(--muted); min-width: 32px;
+      flex-shrink: 0;
+    }
+    .t-icon { font-size: 14px; flex-shrink: 0; }
+    .t-text { color: var(--text); }
+
+    /* ── Filter input ─────────────────────────────────────────────── */
+    .filter-input {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      padding: 4px 8px;
+      font-size: 12px;
+      outline: none;
+      width: 180px;
+    }
+    .filter-input:focus { border-color: var(--accent); }
+
+    /* ── Loading overlay ──────────────────────────────────────────── */
+    #loading {
+      position: fixed; inset: 0;
+      background: var(--bg);
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 16px;
+      z-index: 200;
+    }
+    #loading.hidden { display: none; }
+    .spinner {
+      width: 36px; height: 36px;
+      border: 3px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Scrollbar ─────────────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+<!-- Loading overlay (hidden once data is injected) -->
+<div id="loading">
+  <div class="spinner"></div>
+  <span style="color:var(--muted);font-size:13px;">Loading match data…</span>
+</div>
+
+<header>
+  <div class="logo">
+    <div class="logo-ball"></div>
+    <h1>World Cup <span>Analytics</span></h1>
+  </div>
+
+  <div class="controls">
+    <div class="ctrl-group">
+      <label>Filter by Team</label>
+      <select id="teamSelect" onchange="handleTeamChange()"></select>
+    </div>
+    <div class="ctrl-group">
+      <label>Match</label>
+      <select id="matchupSelect" onchange="loadMatchupData()"></select>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div id="no-data" class="hidden">
+    No match data found. Run <code>build_dashboard.py</code> to generate data.
+  </div>
+
+  <div id="dashboard-content" class="hidden">
+    <div class="panel-grid">
+
+      <!-- ── Shot Map ─────────────────────────────────────────── -->
+      <div class="panel" id="shotmap-panel">
+        <div class="panel-header">
+          <h2>Shot Map</h2>
+          <select id="shotTeamFilter" class="filter-input" onchange="renderShotMap()">
+            <option value="all">Both Teams</option>
+          </select>
+        </div>
+        <div class="panel-body" style="padding:10px">
+          <div id="shotmap-container"></div>
+          <div id="shot-legend" style="display:flex;gap:16px;margin-top:8px;font-size:11px;color:var(--muted);justify-content:center">
+            <span>⭐ Goal</span>
+            <span style="color:var(--accent)">● Shot on target</span>
+            <span style="color:var(--muted)">● Shot off target</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Momentum ─────────────────────────────────────────── -->
+      <div class="panel" id="momentum-panel">
+        <div class="panel-header">
+          <h2>Match Momentum</h2>
+          <span style="font-size:11px;color:var(--muted)">Shot attempts per 5-min window</span>
+        </div>
+        <div class="panel-body" style="padding:10px">
+          <div id="momentum-container"></div>
+        </div>
+      </div>
+
+      <!-- ── Team Stats ───────────────────────────────────────── -->
+      <div class="panel" id="stats-panel">
+        <div class="panel-header">
+          <h2>Team Statistics</h2>
+          <div style="display:flex;gap:20px;font-size:12px;font-weight:600">
+            <span style="color:var(--accent)"  id="stats-t1-name">Team A</span>
+            <span style="color:var(--accent2)" id="stats-t2-name">Team B</span>
+          </div>
+        </div>
+        <div class="panel-body" style="padding:0">
+          <div class="stats-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th style="text-align:left" id="th-t1">Team A</th>
+                  <th style="text-align:center">Stat</th>
+                  <th style="text-align:right" id="th-t2">Team B</th>
+                </tr>
+              </thead>
+              <tbody id="stats-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Formations & Lineups ─────────────────────────────── -->
+      <div class="panel" id="lineup-panel">
+        <div class="panel-header">
+          <h2>Formations &amp; Starting XI</h2>
+        </div>
+        <div class="panel-body">
+          <div class="lineup-grid" id="lineup-container"></div>
+        </div>
+      </div>
+
+      <!-- ── Match Timeline ───────────────────────────────────── -->
+      <div class="panel" id="timeline-panel">
+        <div class="panel-header">
+          <h2>Match Timeline</h2>
+          <input class="filter-input" id="timeline-filter" placeholder="Search events…"
+                 oninput="filterTimeline()" />
+        </div>
+        <div class="panel-body" style="padding:0 16px">
+          <div class="timeline-scroll" id="timeline-container"></div>
+        </div>
+      </div>
+
+    </div><!-- /.panel-grid -->
+  </div><!-- /#dashboard-content -->
+</main>
+
+<script>
+/* {{DATA_PAYLOAD_MARKER}} */
+
+// ── Globals ────────────────────────────────────────────────────────────────
+let currentMatch = null;
+
+// ── Boot ───────────────────────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('loading').classList.add('hidden');
+
+  if (typeof MATCH_DATA === 'undefined' || Object.keys(MATCH_DATA).length === 0) {
+    document.getElementById('no-data').classList.remove('hidden');
+    return;
+  }
+
+  const teamSelect = document.getElementById('teamSelect');
+  Object.keys(MATCH_DATA).sort().forEach(t => {
+    teamSelect.add(new Option(t, t));
+  });
+
+  document.getElementById('dashboard-content').classList.remove('hidden');
+  handleTeamChange();
+});
+
+// ── Selectors ──────────────────────────────────────────────────────────────
+function handleTeamChange() {
+  const team   = document.getElementById('teamSelect').value;
+  const mSel   = document.getElementById('matchupSelect');
+  const matches = Object.keys(MATCH_DATA[team] || {}).sort();
+  mSel.innerHTML = '';
+  matches.forEach(m => mSel.add(new Option(m, m)));
+  loadMatchupData();
+}
+
+function loadMatchupData() {
+  const team    = document.getElementById('teamSelect').value;
+  const matchup = document.getElementById('matchupSelect').value;
+  if (!team || !matchup) return;
+
+  currentMatch = MATCH_DATA[team][matchup];
+  renderAll();
+}
+
+function renderAll() {
+  if (!currentMatch) return;
+  renderShotMap();
+  renderMomentum();
+  renderTeamStats();
+  renderLineups();
+  renderTimeline();
+  populateShotTeamFilter();
+}
+
+// ── Shot Map ───────────────────────────────────────────────────────────────
+function populateShotTeamFilter() {
+  const sel = document.getElementById('shotTeamFilter');
+  sel.innerHTML = '<option value="all">Both Teams</option>';
+  [currentMatch.team1, currentMatch.team2].forEach(t => {
+    if (t) sel.add(new Option(t, t));
+  });
+}
+
+function renderShotMap() {
+  const container = document.getElementById('shotmap-container');
+  const filterVal = document.getElementById('shotTeamFilter').value;
+  const shots     = (currentMatch.shots || [])
+    .filter(s => filterVal === 'all' || s.team === filterVal);
+
+  if (!shots.length) {
+    Plotly.purge(container);
+    container.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:380px;color:var(--muted);font-size:13px;">No shot data available</div>`;
+    return;
+  }
+
+  // Group by outcome category
+  const groups = { 'Goal': [], 'On Target': [], 'Off Target': [] };
+  shots.forEach(s => {
+    const out = (s.outcome || '').toLowerCase();
+    if (out === 'goal') groups['Goal'].push(s);
+    else if (out.includes('saved') || out.includes('on target')) groups['On Target'].push(s);
+    else groups['Off Target'].push(s);
+  });
+
+  const palette = {
+    'Goal':       { color: '#f59e0b', symbol: 'star',   size: 16 },
+    'On Target':  { color: '#38bdf8', symbol: 'circle', size: 10 },
+    'Off Target': { color: '#475569', symbol: 'circle-open', size: 9 },
+  };
+
+  const traces = Object.entries(groups)
+    .filter(([, arr]) => arr.length)
+    .map(([label, arr]) => ({
+      type:   'scatter',
+      mode:   'markers',
+      name:   label,
+      x: arr.map(s => s.x),
+      y: arr.map(s => s.y),
+      text: arr.map(s =>
+        `<b>${s.player}</b><br>${s.team}<br>Min: ${s.minute}'<br>Outcome: ${s.outcome}<br>xG: ${(+s.xg || 0).toFixed(2)}`
+      ),
+      hovertemplate: '%{text}<extra></extra>',
+      marker: {
+        ...palette[label],
+        line: { width: 1.5, color: '#fff' },
+      },
+    }));
+
+  // Pitch markings (attacking right, half-pitch)
+  const shapes = [
+    // Pitch half background
+    { type:'rect', x0:60, y0:0, x1:120, y1:80,
+      fillcolor:'#0d3d1f', line:{color:'rgba(255,255,255,0.5)',width:2} },
+    // Left edge line
+    { type:'line', x0:60, y0:0, x1:60, y1:80,
+      line:{color:'rgba(255,255,255,0.5)',width:2} },
+    // Centre circle arc (partial)
+    { type:'circle', x0:50, y0:30, x1:70, y1:50,
+      line:{color:'rgba(255,255,255,0.3)',width:1.5} },
+    // Penalty area
+    { type:'rect', x0:102, y0:18, x1:120, y1:62,
+      line:{color:'rgba(255,255,255,0.5)',width:1.5} },
+    // 6-yard box
+    { type:'rect', x0:114, y0:30, x1:120, y1:50,
+      line:{color:'rgba(255,255,255,0.5)',width:1.5} },
+    // Penalty spot
+    { type:'circle', x0:107.8, y0:39.7, x1:108.2, y1:40.3,
+      fillcolor:'white', line:{color:'white',width:1} },
+    // Penalty arc
+    { type:'circle', x0:98, y0:30, x1:118, y1:50,
+      line:{color:'rgba(255,255,255,0.25)',width:1,dash:'dot'} },
+    // Goal
+    { type:'rect', x0:120, y0:36, x1:121.5, y1:44,
+      fillcolor:'rgba(255,255,255,0.08)', line:{color:'rgba(255,255,255,0.7)',width:1.5} },
+  ];
+
+  const layout = {
+    xaxis: { range:[60,122], fixedrange:true, showgrid:false, zeroline:false, showticklabels:false },
+    yaxis: { range:[0,80],  autorange:'reversed', fixedrange:true, showgrid:false, zeroline:false, showticklabels:false },
+    shapes,
+    paper_bgcolor: 'transparent',
+    plot_bgcolor:  'transparent',
+    font:   { color:'#94a3b8', size:11, family:'Inter,system-ui,sans-serif' },
+    margin: { l:10, r:10, t:10, b:10 },
+    legend: { orientation:'h', x:0.5, xanchor:'center', y:-0.05,
+              bgcolor:'transparent', font:{size:11} },
+    hovermode: 'closest',
+    height: 360,
+  };
+
+  container.innerHTML = '';
+  Plotly.newPlot(container, traces, layout, { responsive:true, displayModeBar:false });
+}
+
+// ── Momentum Chart ─────────────────────────────────────────────────────────
+function renderMomentum() {
+  const container = document.getElementById('momentum-container');
+  const momentum  = currentMatch.momentum || [];
+  const t1        = currentMatch.team1;
+  const t2        = currentMatch.team2;
+
+  if (!momentum.length) {
+    Plotly.purge(container);
+    container.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;height:380px;color:var(--muted);font-size:13px;">No momentum data</div>`;
+    return;
+  }
+
+  const minutes = momentum.map(b => `${b.minute}'`);
+  const t1vals  = momentum.map(b => b[t1] || 0);
+  const t2vals  = momentum.map(b => -(b[t2] || 0)); // negative for mirrored bar chart
+
+  const traces = [
+    {
+      type:'bar', name: t1, x: minutes, y: t1vals,
+      marker:{ color:'#38bdf8' },
+      hovertemplate: `%{x}  ${t1}: %{y}<extra></extra>`,
+    },
+    {
+      type:'bar', name: t2, x: minutes, y: t2vals,
+      marker:{ color:'#f59e0b' },
+      hovertemplate: `%{x}  ${t2}: %{customdata}<extra></extra>`,
+      customdata: t2vals.map(v => Math.abs(v)),
+    },
+  ];
+
+  const layout = {
+    barmode: 'overlay',
+    xaxis: {
+      color:'#475569', tickfont:{size:10}, gridcolor:'rgba(255,255,255,0.05)',
+      title:{ text:'Minute', font:{color:'#475569',size:11} }
+    },
+    yaxis: {
+      color:'#475569', tickfont:{size:10}, gridcolor:'rgba(255,255,255,0.05)',
+      zeroline:true, zerolinecolor:'rgba(255,255,255,0.2)', zerolinewidth:1,
+      tickvals:[-3,-2,-1,0,1,2,3], ticktext:['3','2','1','0','1','2','3'],
+      title:{ text:'Shot attempts', font:{color:'#475569',size:11} }
+    },
+    paper_bgcolor:'transparent', plot_bgcolor:'transparent',
+    font:{ color:'#94a3b8', family:'Inter,system-ui,sans-serif' },
+    margin:{ l:40, r:10, t:10, b:40 },
+    legend:{ orientation:'h', x:0.5, xanchor:'center', y:-0.18,
+             bgcolor:'transparent', font:{size:11} },
+    height: 360,
+  };
+
+  container.innerHTML = '';
+  Plotly.newPlot(container, traces, layout, { responsive:true, displayModeBar:false });
+}
+
+// ── Team Stats ─────────────────────────────────────────────────────────────
+function renderTeamStats() {
+  const m  = currentMatch;
+  document.getElementById('th-t1').textContent       = m.team1;
+  document.getElementById('th-t2').textContent       = m.team2;
+  document.getElementById('stats-t1-name').textContent = m.team1;
+  document.getElementById('stats-t2-name').textContent = m.team2;
+
+  const s1  = m.team_stats[m.team1] || [];
+  const s2  = m.team_stats[m.team2] || [];
+  const body = document.getElementById('stats-body');
+  body.innerHTML = '';
+
+  if (!s1.length && !s2.length) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td colspan="3" style="padding:20px;text-align:center;color:var(--muted)">No statistics available</td>`;
+    body.appendChild(tr);
+    return;
+  }
+
+  s1.forEach(metric => {
+    const m2  = s2.find(x => x.name === metric.name) || { displayValue: '—' };
+    const tr  = document.createElement('tr');
+    // Simple bar visualisation inline
+    const v1  = parseFloat(metric.displayValue) || 0;
+    const v2  = parseFloat(m2.displayValue)     || 0;
+    const max = Math.max(v1, v2, 1);
+    const pct1 = Math.round((v1 / max) * 100);
+    const pct2 = Math.round((v2 / max) * 100);
+
+    tr.innerHTML = `
+      <td class="val t1-val">
+        <div style="display:flex;align-items:center;gap:6px">
+          <span>${metric.displayValue}</span>
+          <div style="flex:1;height:4px;background:var(--surface2);border-radius:2px;min-width:40px;max-width:80px">
+            <div style="height:4px;background:var(--accent);border-radius:2px;width:${pct1}%"></div>
+          </div>
+        </div>
+      </td>
+      <td class="label">${metric.label || metric.name || ''}</td>
+      <td class="val t2-val">
+        <div style="display:flex;align-items:center;gap:6px;justify-content:flex-end">
+          <div style="flex:1;height:4px;background:var(--surface2);border-radius:2px;min-width:40px;max-width:80px">
+            <div style="height:4px;background:var(--accent2);border-radius:2px;width:${pct2}%;margin-left:auto"></div>
+          </div>
+          <span>${m2.displayValue}</span>
+        </div>
+      </td>`;
+    body.appendChild(tr);
+  });
+}
+
+// ── Lineups ────────────────────────────────────────────────────────────────
+// Formation layout: maps "4-3-3" → relative y-positions per line
+function parseFormation(formStr) {
+  if (!formStr) return [4,4,2]; // default
+  return formStr.split('-').map(Number).filter(n => !isNaN(n) && n > 0);
+}
+
+function positionPlayers(starters, formLines) {
+  // starters sorted by jersey or index; GK always first
+  const positions = [];
+  let idx = 0;
+
+  // GK at bottom (y=90%)
+  positions.push({ x: 50, y: 88, player: starters[idx] || null, isGk: true });
+  idx++;
+
+  // Lines from back to front
+  const lineCount = formLines.length;
+  formLines.forEach((count, lineIdx) => {
+    const yPct = 70 - ((lineIdx / (lineCount - 0.5)) * 55);
+    for (let i = 0; i < count; i++) {
+      const xPct = ((i + 1) / (count + 1)) * 100;
+      positions.push({ x: xPct, y: yPct, player: starters[idx] || null, isGk: false });
+      idx++;
+    }
+  });
+
+  return positions;
+}
+
+function renderLineups() {
+  const container = document.getElementById('lineup-container');
+  container.innerHTML = '';
+
+  (currentMatch.lineups || []).forEach(roster => {
+    const teamName  = roster.team?.displayName || 'Team';
+    const formation = roster.formation || '';
+    const starters  = (roster.roster || []).filter(p => p.starter);
+
+    const card = document.createElement('div');
+    card.className = 'team-lineup-card';
+    card.innerHTML = `
+      <h3>${teamName}
+        ${formation ? `<span class="formation-badge">${formation}</span>` : ''}
+      </h3>`;
+
+    // ── Pitch visualisation ──
+    if (starters.length > 0) {
+      const pitchEl   = document.createElement('div');
+      pitchEl.className = 'pitch-visual';
+
+      // Static pitch lines
+      pitchEl.innerHTML = `
+        <div class="pitch-line h" style="top:50%"></div>
+        <div class="pitch-line h" style="top:85%;left:20%;right:20%"></div>
+        <div class="pitch-line h" style="top:15%;left:20%;right:20%"></div>
+        <div class="pitch-line v" style="left:20%;top:15%;bottom:15%"></div>
+        <div class="pitch-line v" style="right:20%;top:15%;bottom:15%"></div>
+        <div class="pitch-circle" style="width:30%;padding-top:30%;left:35%;top:35%"></div>
+      `;
+
+      const formLines = parseFormation(formation);
+      const dots      = positionPlayers(starters, formLines);
+
+      dots.forEach(dot => {
+        if (!dot.player) return;
+        const name    = dot.player.athlete?.shortName
+                     || dot.player.athlete?.displayName
+                     || '?';
+        const jersey  = dot.player.jersey || '';
+        const el      = document.createElement('div');
+        el.className  = `player-dot${dot.isGk ? ' gk' : ''}`;
+        el.style.left = `${dot.x}%`;
+        el.style.top  = `${dot.y}%`;
+        el.title      = `${jersey ? '#'+jersey+' ' : ''}${dot.player.athlete?.displayName || name}`;
+        el.innerHTML  = `
+          <div class="dot">${jersey || '?'}</div>
+          <div class="pname">${name.split(' ').pop()}</div>`;
+        pitchEl.appendChild(el);
+      });
+
+      card.appendChild(pitchEl);
+    }
+
+    // ── Starter list ──
+    const ul = document.createElement('ul');
+    ul.className = 'starter-list';
+    starters.forEach(p => {
+      const li = document.createElement('li');
+      li.innerHTML = `
+        <span class="jersey-num">${p.jersey || '—'}</span>
+        <span>${p.athlete?.displayName || 'Unknown'}</span>
+        <span class="player-pos">${p.position?.abbreviation || ''}</span>`;
+      ul.appendChild(li);
+    });
+    card.appendChild(ul);
+    container.appendChild(card);
+  });
+
+  if (!currentMatch.lineups?.length) {
+    container.innerHTML = `<p style="color:var(--muted);font-size:13px">Lineup data not available for this match.</p>`;
+  }
+}
+
+// ── Timeline ───────────────────────────────────────────────────────────────
+const EVENT_ICONS = {
+  goal:         '⚽',
+  yellow_card:  '🟨',
+  red_card:     '🟥',
+  substitution: '🔄',
+  shot:         '🎯',
+  penalty:      '⚡',
+  offside:      '🚩',
+  foul:         '🤛',
+  period:       '🕐',
+  other:        '•',
+};
+
+function renderTimeline(filter = '') {
+  const container = document.getElementById('timeline-container');
+  const events    = (currentMatch.timeline || [])
+    .filter(e => !filter || e.text?.toLowerCase().includes(filter.toLowerCase()));
+
+  container.innerHTML = '';
+
+  if (!events.length) {
+    container.innerHTML = `<p style="padding:20px;color:var(--muted);font-size:13px">No events found.</p>`;
+    return;
+  }
+
+  events.forEach(e => {
+    const el = document.createElement('div');
+    el.className = 'timeline-event';
+    el.innerHTML = `
+      <span class="t-minute">${e.minute}'</span>
+      <span class="t-icon">${EVENT_ICONS[e.event_type] || '•'}</span>
+      <span class="t-text">${e.text}</span>`;
+    container.appendChild(el);
+  });
+}
+
+function filterTimeline() {
+  renderTimeline(document.getElementById('timeline-filter').value);
+}
+</script>
+</body>
+</html>
