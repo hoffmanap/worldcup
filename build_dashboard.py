@@ -97,11 +97,9 @@ class WorldCupDataCompiler:
         ids = set(self.SEED_GAME_IDS)
         
         try:
-            # Hit the ESPN scoreboard endpoint
             response = requests.get(self.SCOREBOARD_URL, timeout=10)
             if response.status_code == 200:
                 data = response.json()
-                # Parse through the events and extract the game ID
                 for event in data.get('events', []):
                     game_id = event.get('id')
                     if game_id:
@@ -112,7 +110,6 @@ class WorldCupDataCompiler:
         except Exception as e:
             print(f"Error fetching live games: {e}")
             
-        # THE FIX: Convert every ID in the set to a string before sorting
         result = sorted([str(game_id) for game_id in ids])
         
         print(f"Discovered {len(result)} total matches to process.")
