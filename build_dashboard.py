@@ -31,7 +31,7 @@ TOURNAMENT_START = date(2026, 6, 11)
 TOURNAMENT_END   = date(2026, 7, 19)
 SB_COMPETITION_ID = 43
 SB_SEASON_ID      = 106
-SEED_GAME_IDS     = [760419]
+SEED_GAME_IDS     = ["760419"]
 
 
 def parse_clock(display_value):
@@ -87,7 +87,7 @@ class WorldCupDataCompiler:
                 if r.status_code == 200:
                     for evt in r.json().get("events", []):
                         if evt.get("id"):
-                            ids.add(evt["id"])
+                            ids.add(str(evt["id"]))
             except Exception as exc:
                 print(f"  [!] Scoreboard {cur}: {exc}")
             cur += timedelta(days=1)
@@ -446,5 +446,4 @@ if __name__ == "__main__":
         WorldCupDataCompiler.export_html(compiled)
     else:
         print("[-] No data compiled")
-        sys.exit(1)
         sys.exit(1)
