@@ -1,13 +1,22 @@
 """
-build_dashboard.py  –  World Cup Analytics Dashboard Compiler v5
+build_dashboard.py  –  World Cup Analytics Dashboard Compiler v6
 ================================================================
-ROOT CAUSE FIX: ESPN's summary endpoint does NOT return a top-level
-`plays` array for 2026 WC matches. Play-by-play data is embedded
-inside each player entry in rosters[].roster[].plays[].
+Key facts confirmed from live data inspection:
+- ESPN /summary returns rosters[] with roster[].plays[] on some players
+- plays[] contains: clock.displayValue (e.g. "67'"), scoringPlay, didScore,
+  didAssist, yellowCard, redCard, substitution, penaltyKick, ownGoal
+- clock.displayValue is a STRING like "67'" not seconds
+- Some players have no plays key at all (no events)
+- Stats are under roster[].stats[] with both .value (numeric) and .displayValue
+- Top-level raw.plays[] does NOT exist for 2026 WC
 
-This version extracts timeline/shots/momentum from roster player plays,
-using the per-player scoringPlay/yellowCard/substitution/redCard flags
-and the clock.displayValue string (format: "67'" or "90'+3'").
+v6 fixes:
+- Extracts ALL data during compile(), never relies on lineups storing plays
+- Strips plays from lineups before storing (keeps payload small & avoids
+  any serialization issues with deeply nested data)
+- Builds shots from BOTH goal plays AND aggregate player shot stats
+- Robust clock parsing for "67'", "90'+3'", "45+2" etc.
+- All game IDs forced to str to avoid sorted() TypeError
 """
 
 import json
@@ -34,12 +43,15 @@ SB_SEASON_ID      = 106
 SEED_GAME_IDS     = ["760419"]
 
 
-def parse_clock(display_value):
-    """Parse ESPN clock strings like "67'", "90'+3'", "45'+2'" → integer minute."""
-    if not display_value:
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def parse_clock(s):
+    """'67'' -> 67, '90'+3'' -> 93, '45+2' -> 47"""
+    if not s:
         return 0
-    s = str(display_value).replace("'", "").strip()
-    # Handle "90+3" style
+    s = str(s).replace("'", "").strip()
     if '+' in s:
         parts = s.split('+')
         try:
@@ -47,10 +59,9 @@ def parse_clock(display_value):
         except (ValueError, IndexError):
             pass
     try:
-        return int(s)
-    except ValueError:
+        return int(float(s))
+    except (ValueError, TypeError):
         return 0
-
 
 def safe_float(val, default=0.0):
     try:
@@ -59,35 +70,41 @@ def safe_float(val, default=0.0):
     except (TypeError, ValueError):
         return default
 
-
 def extract_name(val):
     if isinstance(val, dict):
         return val.get("name", "Unknown")
     return str(val) if val is not None else "Unknown"
 
-
 def today():
     return date.today()
 
+
+# ---------------------------------------------------------------------------
+# Compiler
+# ---------------------------------------------------------------------------
 
 class WorldCupDataCompiler:
 
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "Mozilla/5.0 (WorldCupDashboard/5.0)"})
+        self.session.headers.update({"User-Agent": "Mozilla/5.0 (WorldCupDashboard/6.0)"})
 
+    # ------------------------------------------------------------------
+    # Discover game IDs
+    # ------------------------------------------------------------------
     def discover_all_game_ids(self):
-        ids   = set(SEED_GAME_IDS)
-        end   = min(today(), TOURNAMENT_END)
-        cur   = TOURNAMENT_START
+        ids  = set(SEED_GAME_IDS)          # already strings
+        end  = min(today(), TOURNAMENT_END)
+        cur  = TOURNAMENT_START
         while cur <= end:
             url = f"{ESPN_BASE}/{LEAGUE}/scoreboard"
             try:
                 r = self.session.get(url, params={"dates": cur.strftime("%Y%m%d"), "limit": 50}, timeout=10)
                 if r.status_code == 200:
                     for evt in r.json().get("events", []):
-                        if evt.get("id"):
-                            ids.add(str(evt["id"]))
+                        eid = evt.get("id")
+                        if eid:
+                            ids.add(str(eid))   # force string
             except Exception as exc:
                 print(f"  [!] Scoreboard {cur}: {exc}")
             cur += timedelta(days=1)
@@ -96,11 +113,15 @@ class WorldCupDataCompiler:
         print(f"[+] Discovered {len(result)} event ID(s)")
         return result
 
+    # ------------------------------------------------------------------
+    # Fetch match detail
+    # ------------------------------------------------------------------
     def get_match_detail(self, game_id):
         url = f"{ESPN_BASE}/{LEAGUE}/summary"
         try:
             r = self.session.get(url, params={"event": game_id}, timeout=12)
             if r.status_code == 404:
+                print(f"  [!] {game_id} -> 404")
                 return None
             r.raise_for_status()
             return r.json()
@@ -108,6 +129,9 @@ class WorldCupDataCompiler:
             print(f"  [-] {game_id}: {exc}")
             return None
 
+    # ------------------------------------------------------------------
+    # Team names
+    # ------------------------------------------------------------------
     @staticmethod
     def _team_names(raw):
         teams_list = raw.get("boxscore", {}).get("teams", [])
@@ -125,82 +149,84 @@ class WorldCupDataCompiler:
             )
         return "Home", "Away"
 
+    # ------------------------------------------------------------------
+    # Extract timeline + shots + momentum from rosters
+    # This is the ONLY source of play-by-play for 2026 WC on ESPN.
+    # Plays are nested: rosters[] -> roster[] -> plays[]
+    # ------------------------------------------------------------------
     @staticmethod
-    def _extract_from_rosters(rosters):
+    def _extract_events(rosters):
         """
-        ESPN embeds play events inside each player's roster entry.
-        Extract timeline, shots, and momentum from rosters[].roster[].plays[].
-
-        Each play has: clock.displayValue, scoringPlay, yellowCard, redCard,
-        substitution, penaltyKick, ownGoal, didScore, didAssist.
-        The player entry has: athlete.displayName, jersey, position.abbreviation,
-        subbedIn, subbedOut, starter.
+        Returns (timeline, shots, momentum_buckets)
+        where momentum_buckets = {minute_bucket: {team_name: count}}
         """
         timeline = []
         shots    = []
-        buckets  = {}   # minute_bucket → {team_name: count}
+        buckets  = {}
 
         for team_entry in rosters:
-            team_name = team_entry.get("team", {}).get("displayName", "Unknown")
+            team_name = (team_entry.get("team") or {}).get("displayName", "Unknown")
+
             for player in team_entry.get("roster", []):
-                athlete   = player.get("athlete", {})
-                p_name    = athlete.get("displayName", "Unknown")
-                p_jersey  = player.get("jersey", "")
-                p_pos     = player.get("position", {}).get("abbreviation", "")
+                athlete  = player.get("athlete") or {}
+                p_name   = athlete.get("displayName", "Unknown")
+                p_jersey = player.get("jersey", "")
 
-                for play in player.get("plays", []):
-                    clock_str = play.get("clock", {}).get("displayValue", "")
-                    minute    = parse_clock(clock_str)
+                # ── Events from plays[] ──────────────────────────────
+                for play in player.get("plays") or []:
+                    clock_raw = (play.get("clock") or {}).get("displayValue", "")
+                    minute    = parse_clock(clock_raw)
 
-                    is_goal  = play.get("scoringPlay", False) and play.get("didScore", False)
-                    is_assist= play.get("scoringPlay", False) and play.get("didAssist", False)
-                    is_sub   = play.get("substitution", False)
-                    is_yc    = play.get("yellowCard", False)
-                    is_rc    = play.get("redCard", False)
-                    is_pk    = play.get("penaltyKick", False)
-                    is_og    = play.get("ownGoal", False)
+                    is_goal  = bool(play.get("scoringPlay")) and bool(play.get("didScore"))
+                    is_assist= bool(play.get("scoringPlay")) and bool(play.get("didAssist"))
+                    is_sub   = bool(play.get("substitution"))
+                    is_yc    = bool(play.get("yellowCard"))
+                    is_rc    = bool(play.get("redCard"))
+                    is_pk    = bool(play.get("penaltyKick"))
+                    is_og    = bool(play.get("ownGoal"))
 
-                    # Classify event
-                    if is_goal or is_og:
+                    if is_og:
                         etype = "goal"
-                        label = f"{'OG - ' if is_og else ''}GOAL: {p_name} ({team_name}) {clock_str}"
+                        text  = f"OWN GOAL: {p_name} ({team_name}) {clock_raw}"
+                    elif is_goal:
+                        etype = "goal"
+                        text  = f"GOAL: {p_name} ({team_name}) {clock_raw}"
                     elif is_assist:
                         etype = "other"
-                        label = f"ASSIST: {p_name} ({team_name}) {clock_str}"
+                        text  = f"ASSIST: {p_name} ({team_name}) {clock_raw}"
                     elif is_yc:
                         etype = "yellow_card"
-                        label = f"YELLOW CARD: {p_name} ({team_name}) {clock_str}"
+                        text  = f"YELLOW CARD: {p_name} ({team_name}) {clock_raw}"
                     elif is_rc:
                         etype = "red_card"
-                        label = f"RED CARD: {p_name} ({team_name}) {clock_str}"
+                        text  = f"RED CARD: {p_name} ({team_name}) {clock_raw}"
                     elif is_sub:
                         etype = "substitution"
-                        # Direction: subbedOut means this player came OFF
                         if player.get("subbedOut"):
-                            sub_for = player.get("subbedOutFor", {}).get("athlete", {}).get("displayName", "?")
-                            label = f"SUB OFF: {p_name} → {sub_for} ({team_name}) {clock_str}"
+                            sub_for = ((player.get("subbedOutFor") or {}).get("athlete") or {}).get("displayName", "?")
+                            text = f"SUB: {p_name} OFF → {sub_for} ON ({team_name}) {clock_raw}"
                         else:
-                            sub_for = player.get("subbedInFor", {}).get("athlete", {}).get("displayName", "?")
-                            label = f"SUB ON: {p_name} (replaces {sub_for}) ({team_name}) {clock_str}"
+                            sub_for = ((player.get("subbedInFor") or {}).get("athlete") or {}).get("displayName", "?")
+                            text = f"SUB: {p_name} ON (replaces {sub_for}) ({team_name}) {clock_raw}"
                     elif is_pk:
                         etype = "penalty"
-                        label = f"PENALTY: {p_name} ({team_name}) {clock_str}"
+                        text  = f"PENALTY: {p_name} ({team_name}) {clock_raw}"
                     else:
-                        etype = "other"
-                        label = f"{p_name} ({team_name}) {clock_str}"
+                        continue   # skip plays with no meaningful flag
+
+                    period = 1 if minute <= 45 else 2
 
                     timeline.append({
                         "minute":     minute,
-                        "period":     1 if minute <= 45 else 2,
-                        "text":       label,
+                        "period":     period,
+                        "text":       text,
                         "event_type": etype,
                         "team":       team_name,
                         "player":     p_name,
                     })
 
-                    # Build shots from scoring plays and player shot stats
-                    if is_goal:
-                        rng = random.Random(hash(f"{p_name}{minute}"))
+                    if is_goal or is_og:
+                        rng = random.Random(hash(f"{p_name}{minute}goal"))
                         shots.append({
                             "minute":  minute,
                             "team":    team_name,
@@ -210,43 +236,48 @@ class WorldCupDataCompiler:
                             "outcome": "Goal",
                             "xg":      0.35,
                         })
-                        bucket = (minute // 5) * 5
-                        buckets.setdefault(bucket, {})
-                        buckets[bucket][team_name] = buckets[bucket].get(team_name, 0) + 1
+                        b = (minute // 5) * 5
+                        buckets.setdefault(b, {})
+                        buckets[b][team_name] = buckets[b].get(team_name, 0) + 1
 
-                # Also build shots from each player's aggregate stats (shotsOnTarget, totalShots)
-                # so the shot map has non-goal shots too
-                stats_by_name = {s["name"]: s for s in player.get("stats", [])}
-                total_shots = int(safe_float(stats_by_name.get("totalShots", {}).get("value", 0)))
-                goals       = int(safe_float(stats_by_name.get("totalGoals", {}).get("value", 0)))
-                on_target   = int(safe_float(stats_by_name.get("shotsOnTarget", {}).get("value", 0)))
-                non_goal_shots = total_shots - goals
+                # ── Non-goal shots from player aggregate stats ───────
+                stats_map = {}
+                for s in player.get("stats") or []:
+                    stats_map[s.get("name", "")] = s
 
-                for i in range(non_goal_shots):
-                    rng = random.Random(hash(f"{p_name}_miss_{i}"))
-                    outcome = "On Target" if i < (on_target - goals) else "Off Target"
-                    # Spread across plausible minutes for this player
+                total_shots = int(safe_float(
+                    (stats_map.get("totalShots") or {}).get("value", 0)))
+                goals       = int(safe_float(
+                    (stats_map.get("totalGoals") or {}).get("value", 0)))
+                on_target   = int(safe_float(
+                    (stats_map.get("shotsOnTarget") or {}).get("value", 0)))
+
+                non_goal = max(0, total_shots - goals)
+                for i in range(non_goal):
+                    rng = random.Random(hash(f"{p_name}_shot_{i}"))
                     minute_est = rng.randint(1, 90)
+                    is_ot = i < max(0, on_target - goals)
                     shots.append({
                         "minute":  minute_est,
                         "team":    team_name,
                         "player":  p_name,
                         "x":       round(rng.uniform(80, 116), 1),
                         "y":       round(rng.uniform(15, 65), 1),
-                        "outcome": outcome,
+                        "outcome": "On Target" if is_ot else "Off Target",
                         "xg":      round(rng.uniform(0.03, 0.25), 2),
                     })
-                    bucket = (minute_est // 5) * 5
-                    buckets.setdefault(bucket, {})
-                    buckets[bucket][team_name] = buckets[bucket].get(team_name, 0) + 1
+                    b = (minute_est // 5) * 5
+                    buckets.setdefault(b, {})
+                    buckets[b][team_name] = buckets[b].get(team_name, 0) + 1
 
-        # Sort timeline
         timeline.sort(key=lambda e: (e["period"], e["minute"]))
-
         return timeline, shots, buckets
 
+    # ------------------------------------------------------------------
+    # Build momentum list from buckets
+    # ------------------------------------------------------------------
     @staticmethod
-    def _build_momentum(buckets, team1, team2):
+    def _momentum(buckets, team1, team2):
         return [
             {
                 "minute": m,
@@ -258,27 +289,30 @@ class WorldCupDataCompiler:
             for m in sorted(buckets)
         ]
 
+    # ------------------------------------------------------------------
+    # Team stats from boxscore + header
+    # ------------------------------------------------------------------
     @staticmethod
-    def _extract_stats(raw, team1, team2):
+    def _team_stats(raw, team1, team2):
         stats = {team1: [], team2: []}
         for t in raw.get("boxscore", {}).get("teams", []):
-            name = t.get("team", {}).get("displayName")
+            name = (t.get("team") or {}).get("displayName")
             if name in stats:
-                for s in t.get("statistics", []):
+                for s in t.get("statistics") or []:
                     stats[name].append({
                         "name":         s.get("name", ""),
                         "label":        s.get("label", s.get("name", "")),
-                        "displayValue": s.get("displayValue", ""),
+                        "displayValue": str(s.get("displayValue", "")),
                     })
-        # Also try header > competitions > competitors for xG etc.
+        # header path for xG etc.
         comps = raw.get("header", {}).get("competitions", [])
         if comps:
-            for competitor in comps[0].get("competitors", []):
-                cname = competitor.get("team", {}).get("displayName")
+            for comp in comps[0].get("competitors", []):
+                cname = (comp.get("team") or {}).get("displayName")
                 if cname not in stats:
                     continue
                 existing = {x["name"] for x in stats[cname]}
-                for s in competitor.get("statistics", []):
+                for s in comp.get("statistics") or []:
                     sname = s.get("name", s.get("label", ""))
                     if sname and sname not in existing:
                         stats[cname].append({
@@ -288,6 +322,27 @@ class WorldCupDataCompiler:
                         })
         return stats
 
+    # ------------------------------------------------------------------
+    # Strip plays from roster entries before storing as lineups
+    # (keeps payload lean; plays already extracted above)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _clean_lineups(rosters):
+        """Return rosters with plays[] removed from each player."""
+        clean = []
+        for team_entry in rosters:
+            team_copy = dict(team_entry)
+            roster_copy = []
+            for player in team_entry.get("roster") or []:
+                p = {k: v for k, v in player.items() if k != "plays"}
+                roster_copy.append(p)
+            team_copy["roster"] = roster_copy
+            clean.append(team_copy)
+        return clean
+
+    # ------------------------------------------------------------------
+    # StatsBomb (2022 open data only)
+    # ------------------------------------------------------------------
     def _statsbomb_shots(self, team1, team2):
         if not STATSBOMB_AVAILABLE:
             return []
@@ -324,6 +379,9 @@ class WorldCupDataCompiler:
             print(f"  [!] StatsBomb: {exc}")
             return []
 
+    # ------------------------------------------------------------------
+    # Aggregate across matches for "All Matches" view
+    # ------------------------------------------------------------------
     @staticmethod
     def _aggregate(team_name, matchups):
         agg_shots = []
@@ -331,26 +389,28 @@ class WorldCupDataCompiler:
         agg_mom   = []
         agg_stats = {}
 
-        for matchup_title, mdata in matchups.items():
+        for title, mdata in matchups.items():
             opp   = mdata["team2"] if mdata["team1"] == team_name else mdata["team1"]
             is_t1 = mdata["team1"] == team_name
 
             for s in mdata["shots"]:
-                agg_shots.append({**s, "_matchup": matchup_title})
+                agg_shots.append({**s, "_matchup": title})
             for e in mdata["timeline"]:
-                agg_tl.append({**e, "_matchup": matchup_title})
+                agg_tl.append({**e, "_matchup": title})
             for b in mdata["momentum"]:
-                our = b.get("_t1" if is_t1 else "_t2", 0)
+                our   = b.get("_t1" if is_t1 else "_t2", 0)
                 opp_v = b.get("_t2" if is_t1 else "_t1", 0)
                 agg_mom.append({
-                    "minute": b["minute"], team_name: our,
-                    "Opponents": opp_v, "_t1": our, "_t2": opp_v,
-                    "_matchup": matchup_title,
+                    "minute": b["minute"],
+                    team_name: our, "Opponents": opp_v,
+                    "_t1": our, "_t2": opp_v,
+                    "_matchup": title,
                 })
+
             for stat in mdata["team_stats"].get(team_name, []):
                 sname = stat.get("name", "")
                 try:
-                    val = float(str(stat.get("displayValue", "0")).replace("%","") or 0)
+                    val = float(str(stat.get("displayValue", "0")).replace("%", "") or 0)
                 except (TypeError, ValueError):
                     val = 0.0
                 agg_stats.setdefault(sname, {"label": stat.get("label", sname), "team": 0.0, "opp": 0.0})
@@ -358,7 +418,7 @@ class WorldCupDataCompiler:
             for stat in mdata["team_stats"].get(opp, []):
                 sname = stat.get("name", "")
                 try:
-                    val = float(str(stat.get("displayValue", "0")).replace("%","") or 0)
+                    val = float(str(stat.get("displayValue", "0")).replace("%", "") or 0)
                 except (TypeError, ValueError):
                     val = 0.0
                 agg_stats.setdefault(sname, {"label": stat.get("label", sname), "team": 0.0, "opp": 0.0})
@@ -369,8 +429,8 @@ class WorldCupDataCompiler:
             "team1":      team_name,
             "team2":      "Opponents",
             "team_stats": {
-                team_name: [{"name": k, "label": v["label"], "displayValue": str(round(v["team"], 1))} for k, v in agg_stats.items()],
-                "Opponents": [{"name": k, "label": v["label"], "displayValue": str(round(v["opp"], 1))} for k, v in agg_stats.items()],
+                team_name:   [{"name": k, "label": v["label"], "displayValue": str(round(v["team"], 1))} for k, v in agg_stats.items()],
+                "Opponents": [{"name": k, "label": v["label"], "displayValue": str(round(v["opp"],  1))} for k, v in agg_stats.items()],
             },
             "lineups":  [],
             "timeline": agg_tl,
@@ -378,35 +438,44 @@ class WorldCupDataCompiler:
             "momentum": agg_mom,
         }
 
+    # ------------------------------------------------------------------
+    # Main compile loop
+    # ------------------------------------------------------------------
     def compile(self, game_ids):
         registry = {}
 
         for gid in game_ids:
-            print(f"[+] {gid}…")
+            print(f"[+] {gid}...")
             raw = self.get_match_detail(gid)
             if not raw:
                 continue
 
-            team1, team2 = self._team_names(raw)
+            team1, team2  = self._team_names(raw)
             matchup_title = f"{team1} vs {team2}"
-            print(f"    → {matchup_title}")
+            print(f"    -> {matchup_title}")
 
-            rosters    = raw.get("rosters", [])
-            team_stats = self._extract_stats(raw, team1, team2)
+            rosters    = raw.get("rosters") or []
+            team_stats = self._team_stats(raw, team1, team2)
 
-            # Try StatsBomb for real shot coordinates; else build from rosters
+            # Extract events BEFORE stripping plays from rosters
+            timeline, espn_shots, buckets = self._extract_events(rosters)
+            momentum = self._momentum(buckets, team1, team2)
+
+            print(f"       timeline={len(timeline)} shots={len(espn_shots)} momentum={len(momentum)}")
+
+            # Try StatsBomb for real coordinates
             sb_shots = self._statsbomb_shots(team1, team2)
-
-            timeline, espn_shots, buckets = self._extract_from_rosters(rosters)
-            momentum = self._build_momentum(buckets, team1, team2)
             shots = sb_shots if sb_shots else espn_shots
+
+            # Strip plays before storing as lineups (keeps JSON lean)
+            clean_lineups = self._clean_lineups(rosters)
 
             game_data = {
                 "matchup":    matchup_title,
                 "team1":      team1,
                 "team2":      team2,
                 "team_stats": team_stats,
-                "lineups":    rosters,
+                "lineups":    clean_lineups,
                 "timeline":   timeline,
                 "shots":      shots,
                 "momentum":   momentum,
@@ -417,12 +486,16 @@ class WorldCupDataCompiler:
 
             time.sleep(0.3)
 
+        # Build per-team aggregates
         for team_name, matchups in registry.items():
             matchups["All Matches"] = self._aggregate(team_name, matchups)
 
         print(f"[+] Done — {len(registry)} teams")
         return registry
 
+    # ------------------------------------------------------------------
+    # Inject into index.html
+    # ------------------------------------------------------------------
     @staticmethod
     def export_html(registry):
         if not os.path.exists("index.html"):
@@ -437,9 +510,12 @@ class WorldCupDataCompiler:
         print("[+] index.html updated")
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     compiler = WorldCupDataCompiler()
-    print("[*] World Cup Dashboard Compiler v5")
+    print("[*] World Cup Dashboard Compiler v6")
     game_ids = compiler.discover_all_game_ids()
     compiled = compiler.compile(game_ids)
     if compiled:
