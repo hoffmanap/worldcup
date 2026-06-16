@@ -1,13 +1,7 @@
 """
-build_dashboard.py  –  World Cup Analytics Dashboard Compiler v4
-================================================================
-Changelog from v3:
-- import random moved to top-level (was inside hot loop)
-- Stats now pulled from BOTH boxscore AND header>competitions>competitors
-  so xG, big chances, duels won etc. are captured
-- Momentum buckets in aggregates now use "team" / "opponent" neutral keys
-  instead of dynamic team-name keys so the frontend can always find them
-- Added explicit "shootingPlay" flag check with scoringPlay fallback
+World Cup Dashboard Data Compiler
+Fetches scoreboard data, standardizes IDs, scrapes match details (ESPN & StatsBomb),
+and injects the resulting JSON payload directly into index.html
 """
 
 import json
@@ -72,9 +66,15 @@ class WorldCupDataCompiler:
     # Discover all game IDs by walking tournament dates
     # ------------------------------------------------------------------
     def discover_all_game_ids(self):
-        ids    = set(SEED_GAME_IDS)
-        end    = min(today(), TOURNAMENT_END)
+        """
+        Scrapes the ESPN scoreboard endpoint to discover new matches.
+        Standardizes all IDs as strings to prevent sorting type errors.
+        """
+        print("Discovering game IDs...")
+        ids = set(SEED_GAME_IDS)
+        end = min(today(), TOURNAMENT_END)
         cursor = TOURNAMENT_START
+        
         while cursor <= end:
             date_str = cursor.strftime("%Y%m%d")
             url = f"{ESPN_BASE}/{LEAGUE}/scoreboard"
@@ -82,38 +82,19 @@ class WorldCupDataCompiler:
                 r = self.session.get(url, params={"dates": date_str, "limit": 50}, timeout=10)
                 if r.status_code == 200:
                     for evt in r.json().get("events", []):
-                        if evt.get("id"):
-                            ids.add(evt["id"])
+                        game_id = evt.get("id")
+                        if game_id:
+                            ids.add(game_id)
             except Exception as exc:
                 print(f"  [!] Scoreboard {date_str}: {exc}")
             cursor += timedelta(days=1)
             time.sleep(0.15)
-        def discover_all_game_ids(self):
-        """
-        Scrapes the ESPN scoreboard endpoint to discover new matches.
-        Standardizes all IDs as strings to prevent sorting type errors.
-        """
-        print("Discovering game IDs...")
-        ids = set(self.SEED_GAME_IDS)
-        
-        try:
-            response = requests.get(self.SCOREBOARD_URL, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                for event in data.get('events', []):
-                    game_id = event.get('id')
-                    if game_id:
-                        ids.add(game_id)
-            else:
-                print(f"Warning: Scoreboard returned status code {response.status_code}")
-                
-        except Exception as e:
-            print(f"Error fetching live games: {e}")
             
         result = sorted([str(game_id) for game_id in ids])
         
         print(f"Discovered {len(result)} total matches to process.")
         return result
+
     # ------------------------------------------------------------------
     # Fetch per-match detail
     # ------------------------------------------------------------------
