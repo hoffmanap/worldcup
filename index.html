@@ -76514,36 +76514,22 @@ function renderMomentum() {
     t2v = t2v.map(function(v){ return +(v*scale).toFixed(2); });
   }
 
-  Plotly.react(el, [
-    {
-      type:'bar', name: t1, x: xlabs, y: t1v,
-      marker:{ color:'#00e5ff', line:{width:0} },
-      hovertemplate: '%{x}  ' + t1 + ': %{y}<extra></extra>',
+  Plotly.react(el, traces, {
+    xaxis: { 
+        color:'#3d5a7a', tickfont:{size:14,family:'VT323,monospace'}, 
+        gridcolor:'rgba(255,255,255,0.04)', zeroline:true, zerolinecolor:'rgba(255,255,255,0.15)', zerolinewidth:1 
     },
-    {
-      type:'bar', name: t2, x: xlabs, y: t2v,
-      marker:{ color:'#ff00aa', line:{width:0} },
-      customdata: t2v.map(function(v){ return Math.abs(v); }),
-      hovertemplate: '%{x}  ' + t2 + ': %{customdata}<extra></extra>',
+    yaxis: { 
+        color:'#3d5a7a', tickfont:{size:14,family:'VT323,monospace'}, 
+        gridcolor:'rgba(255,255,255,0.04)', zeroline:true, zerolinecolor:'rgba(255,255,255,0.15)', zerolinewidth:1,
+        title:{ text:'SHOTS', font:{color:'#3d5a7a',size:8,family:'Press Start 2P,monospace'} }
     },
-  ], {
-    barmode: 'overlay',
-    xaxis: {
-      color:'#3d5a7a', tickfont:{size:12,family:'VT323,monospace'},
-      gridcolor:'rgba(255,255,255,0.04)',
-      title:{ text:'MINUTE', font:{color:'#3d5a7a',size:10,family:'Press Start 2P,monospace'} },
-    },
-    yaxis: {
-      color:'#3d5a7a', tickfont:{size:14,family:'VT323,monospace'},
-      gridcolor:'rgba(255,255,255,0.04)',
-      zeroline:true, zerolinecolor:'rgba(255,255,255,0.15)', zerolinewidth:1,
-      title:{ text:'SHOTS', font:{color:'#3d5a7a',size:8,family:'Press Start 2P,monospace'} },
-    },
-    paper_bgcolor:'transparent', plot_bgcolor:'transparent',
-    font:{ color:'#c8ddf0', family:'VT323,monospace' },
-    margin:{ l:50, r:10, t:10, b:50 },
-    legend:{ orientation:'h', x:.5, xanchor:'center', y:-0.2, bgcolor:'transparent', font:{size:15,color:'#c8ddf0'} },
-    height: 390,
+    paper_bgcolor: 'transparent', 
+    plot_bgcolor: 'transparent',
+    font: { color:'#c8ddf0', family:'VT323,monospace' },
+    margin: { l:50, r:10, t:10, b:50 },
+    legend: { orientation:'h', x:.5, xanchor:'center', y:-0.2, bgcolor:'transparent', font:{size:15,color:'#c8ddf0'} },
+    height: 390
   }, { responsive:true, displayModeBar:false });
 
 /* ═══════════════════════════════════════════
