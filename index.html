@@ -75469,9 +75469,13 @@ function renderMomentum() {
     return;
   }
 
-  // Map X (time) and Y (momentum strength) directly from the momentum array
+  // Map X (time) directly from the minute
   var x_vals = momentum.map(function(d) { return d.minute; });
-  var y_vals = momentum.map(function(d) { return d.value; }); 
+
+  // Map Y: Team 1 goes UP (positive), Team 2 goes DOWN (negative)
+  var y_vals = momentum.map(function(d) { 
+      return d._t1 - d._t2; 
+  }); 
 
   var trace = {
     x: x_vals,
@@ -75479,11 +75483,10 @@ function renderMomentum() {
     type: 'scatter',
     mode: 'lines',
     fill: 'tozeroy', // standard Plotly filled area under the curve
-    // ... your other layout and color styling
+    line: { color: '#00e5ff' } // Or whatever CSS var you prefer
   };
-
+  
   var layout = {
-    // Keep whatever styling, margins, and axes you previously had here
     margin: { t: 10, r: 10, b: 20, l: 30 } 
   };
 
