@@ -75469,16 +75469,26 @@ function renderMomentum() {
     return;
   }
 
-  // Aggregate by minute bucket; use _t1/_t2 neutral keys first, fall back to team names
-  var agg = {};
-  momentum.forEach(function(b) {
-    var min = b.minute;
-    if (!agg[min]) agg[min] = { t1: 0, t2: 0 };
-    // Prefer neutral keys (_t1/_t2) which work for both single-match and aggregate
-    agg[min].t1 += (b._t1 !== undefined ? b._t1 : (b[t1] || 0));
-    agg[min].t2 += (b._t2 !== undefined ? b._t2 : (b[t2] || 0));
-  });
+  // Map X (time) and Y (momentum strength) directly from the momentum array
+  var x_vals = momentum.map(function(d) { return d.minute; });
+  var y_vals = momentum.map(function(d) { return d.value; }); 
 
+  var trace = {
+    x: x_vals,
+    y: y_vals,
+    type: 'scatter',
+    mode: 'lines',
+    fill: 'tozeroy', // standard Plotly filled area under the curve
+    // ... your other layout and color styling
+  };
+
+  var layout = {
+    // Keep whatever styling, margins, and axes you previously had here
+    margin: { t: 10, r: 10, b: 20, l: 30 } 
+  };
+
+  Plotly.newPlot(el, [trace], layout);
+}
   var mins  = Object.keys(agg).map(Number).sort(function(a,b){ return a-b; });
   var t1v   = mins.map(function(k){ return  agg[k].t1; });
   var t2v   = mins.map(function(k){ return -agg[k].t2; });
