@@ -31,10 +31,14 @@ jobs:
 
       # ── 3. Install dependencies ─────────────────────────────────────────
       # statsbombpy is optional — the script degrades gracefully without it.
+      # playwright is required for momentum scraping: ESPN renders the
+      # momentum chart client-side via React, so a plain HTTP GET never
+      # contains the bar elements — only a real rendered browser does.
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas beautifulsoup4
+          pip install requests pandas playwright
+          python -m playwright install --with-deps chromium
           pip install statsbombpy || echo "statsbombpy unavailable — using ESPN fallback"
 
       # ── 4. Run the dashboard compiler ──────────────────────────────────
