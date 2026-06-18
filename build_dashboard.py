@@ -708,7 +708,7 @@ class WorldCupDataCompiler:
         else:
             result = re.sub(
                 r'const MATCH_DATA\s*=\s*\{.*?\};',
-                payload,
+                lambda m: payload,
                 template,
                 count=1,
                 flags=re.DOTALL
