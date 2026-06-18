@@ -76435,7 +76435,6 @@ function renderShotMap() {
     };
   });
 
-  // ADDED layer: 'below' to every shape so the pitch stays strictly in the background
   var shapes = [
     { type:'rect',   layer:'below', x0:60,    y0:0,    x1:120,   y1:80,   fillcolor:'#071a0e', line:{color:'rgba(0,255,65,0.5)',width:2} },
     { type:'line',   layer:'below', x0:60,    y0:0,    x1:60,    y1:80,   line:{color:'rgba(0,255,65,0.5)',width:2} },
@@ -76468,7 +76467,6 @@ function renderMomentum() {
   if (!m) return;
 
   var momentum = m.momentum || [];
-  var t1 = m.team1, t2 = m.team2;
 
   if (!momentum.length) {
     Plotly.purge(el);
@@ -76494,11 +76492,14 @@ function renderMomentum() {
   };
   
   var layout = {
-    margin: { t: 10, r: 10, b: 20, l: 30 } 
+    margin: { t: 10, r: 10, b: 20, l: 30 },
+    paper_bgcolor: 'transparent',
+    plot_bgcolor: 'transparent'
   };
 
   Plotly.newPlot(el, [trace], layout);
 }
+
   var mins  = Object.keys(agg).map(Number).sort(function(a,b){ return a-b; });
   var t1v   = mins.map(function(k){ return  agg[k].t1; });
   var t2v   = mins.map(function(k){ return -agg[k].t2; });
@@ -76544,7 +76545,6 @@ function renderMomentum() {
     legend:{ orientation:'h', x:.5, xanchor:'center', y:-0.2, bgcolor:'transparent', font:{size:15,color:'#c8ddf0'} },
     height: 390,
   }, { responsive:true, displayModeBar:false });
-}
 
 /* ═══════════════════════════════════════════
    STATS
