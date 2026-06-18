@@ -75368,24 +75368,6 @@ function updateBanner() {
 /* ═══════════════════════════════════════════
    SHOT MAP
 ═══════════════════════════════════════════ */
-function buildShotPills() {
-  var m    = state.match;
-  var wrap = document.getElementById('shot-pills');
-  wrap.innerHTML = '';
-  ['all', m.team1, m.team2].filter(Boolean).forEach(function(opt) {
-    var btn = document.createElement('button');
-    btn.className = 'pill' + (state.shotFilter === opt ? ' active' : '');
-    btn.textContent = opt === 'all' ? 'BOTH TEAMS' : opt.toUpperCase();
-    btn.onclick = function() {
-      state.shotFilter = opt;
-      document.querySelectorAll('#shot-pills .pill').forEach(function(b){ b.classList.remove('active'); });
-      btn.classList.add('active');
-      renderShotMap();
-    };
-    wrap.appendChild(btn);
-  });
-}
-
 function renderShotMap() {
   var el = document.getElementById('shotmap-wrap');
   var m  = state.match;
@@ -75429,15 +75411,16 @@ function renderShotMap() {
     };
   });
 
+  // ADDED layer: 'below' to every shape so the pitch stays strictly in the background
   var shapes = [
-    { type:'rect',   x0:60,    y0:0,    x1:120,   y1:80,   fillcolor:'#071a0e', line:{color:'rgba(0,255,65,0.5)',width:2} },
-    { type:'line',   x0:60,    y0:0,    x1:60,    y1:80,   line:{color:'rgba(0,255,65,0.5)',width:2} },
-    { type:'rect',   x0:102,   y0:18,   x1:120,   y1:62,   line:{color:'rgba(0,255,65,0.5)',width:1.5} },
-    { type:'rect',   x0:114,   y0:30,   x1:120,   y1:50,   line:{color:'rgba(0,255,65,0.5)',width:1.5} },
-    { type:'circle', x0:50,    y0:30,   x1:70,    y1:50,   line:{color:'rgba(0,255,65,0.25)',width:1.5} },
-    { type:'circle', x0:98,    y0:30,   x1:118,   y1:50,   line:{color:'rgba(0,255,65,0.2)',width:1,dash:'dot'} },
-    { type:'circle', x0:107.8, y0:39.7, x1:108.2, y1:40.3, fillcolor:'#00ff41', line:{color:'#00ff41',width:1} },
-    { type:'rect',   x0:120,   y0:36,   x1:121.5, y1:44,   fillcolor:'rgba(0,255,65,0.1)', line:{color:'rgba(0,255,65,0.6)',width:1.5} },
+    { type:'rect',   layer:'below', x0:60,    y0:0,    x1:120,   y1:80,   fillcolor:'#071a0e', line:{color:'rgba(0,255,65,0.5)',width:2} },
+    { type:'line',   layer:'below', x0:60,    y0:0,    x1:60,    y1:80,   line:{color:'rgba(0,255,65,0.5)',width:2} },
+    { type:'rect',   layer:'below', x0:102,   y0:18,   x1:120,   y1:62,   line:{color:'rgba(0,255,65,0.5)',width:1.5} },
+    { type:'rect',   layer:'below', x0:114,   y0:30,   x1:120,   y1:50,   line:{color:'rgba(0,255,65,0.5)',width:1.5} },
+    { type:'circle', layer:'below', x0:50,    y0:30,   x1:70,    y1:50,   line:{color:'rgba(0,255,65,0.25)',width:1.5} },
+    { type:'circle', layer:'below', x0:98,    y0:30,   x1:118,   y1:50,   line:{color:'rgba(0,255,65,0.2)',width:1,dash:'dot'} },
+    { type:'circle', layer:'below', x0:107.8, y0:39.7, x1:108.2, y1:40.3, fillcolor:'#00ff41', line:{color:'#00ff41',width:1} },
+    { type:'rect',   layer:'below', x0:120,   y0:36,   x1:121.5, y1:44,   fillcolor:'rgba(0,255,65,0.1)', line:{color:'rgba(0,255,65,0.6)',width:1.5} },
   ];
 
   Plotly.react(el, traces, {
