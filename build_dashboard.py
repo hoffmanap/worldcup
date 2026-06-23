@@ -1,23 +1,26 @@
 """
-build_dashboard.py  –  World Cup Dashboard Compiler v7
-=======================================================
-Fixes vs v6:
-1. Score: read from header.competitions[0].competitors[].score (not counted from shots)
-2. Momentum: scraped from ESPN match page HTML momentum bars via CSS calc() values
-3. Shot coords: goals use exact minute from plays[], non-goal shots distributed realistically
-4. All game IDs forced to str; marker-or-regex replacement in export_html
+build_dashboard.py  –  World Cup Dashboard Compiler v10
+========================================================
+Fixes vs v9:
+1. Momentum: the ESPN HTML scraper (Playwright + CSS calc() parsing) was
+   replaced entirely. It failed twice in a row — every match collapsed
+   into a single bucket at minute 0, meaning the CSS selector was
+   matching a wrapper element instead of ESPN's individual per-minute
+   bar divs, and that failure couldn't be diagnosed further without
+   live access to ESPN (blocked in the dev sandbox this script is
+   edited in). Momentum is now COMPUTED from real ESPN event data
+   (shots weighted by xG, goals, cards) with exponential decay — see
+   compute_momentum() for the full model description.
+2. Score: read from header.competitions[0].competitors[].score.
+3. Shot coords: goals use exact minute from plays[], non-goal shots
+   distributed realistically; xG computed from shot geometry.
+4. All game IDs forced to str; marker-or-regex replacement in export_html.
 """
 
-import json, os, sys, time, random, re
+import json, os, sys, time, random, re, math
 from datetime import date, timedelta
 
 import requests
-
-try:
-    from playwright.sync_api import sync_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
 
 try:
     from statsbombpy import sb as statsbomb
@@ -26,7 +29,6 @@ except ImportError:
     STATSBOMB_AVAILABLE = False
 
 ESPN_BASE        = "https://site.api.espn.com/apis/site/v2/sports/soccer"
-ESPN_WEB         = "https://www.espn.com/soccer/match/_/gameId"
 LEAGUE           = "fifa.world"
 TOURNAMENT_START = date(2026, 6, 11)
 TOURNAMENT_END   = date(2026, 7, 19)
@@ -182,85 +184,94 @@ class WorldCupDataCompiler:
     # We need to know which team each bar belongs to — ESPN uses two
     # sibling containers (home/away) that we identify by DOM position.
     # ------------------------------------------------------------------
-    def scrape_momentum(self, game_id, team1, team2):
+    def compute_momentum(self, timeline, shots, team1, team2, match_length=95):
         """
-        ESPN's momentum chart is rendered client-side via React — a plain
-        requests.get() only returns the initial server HTML, which does
-        NOT contain the momentum bar divs (they're injected by JS after
-        load). That's why every previous version silently found 0 bars
-        and fell back to shot-count buckets regardless of what the HTML
-        scraper code looked like.
+        Builds a minute-by-minute momentum curve from real ESPN event
+        data (shots, goals, cards) instead of scraping ESPN's
+        client-side-rendered momentum chart.
 
-        This version uses Playwright to actually load the page in a
-        headless browser, wait for the momentum bars to render, then
-        reads their computed inline style (left: calc(X%...), height: Ypx)
-        — exactly the CSS structure you found via DevTools inspection.
+        Why: the previous scraper read inline CSS from ESPN's React-
+        rendered momentum bars via Playwright. It failed twice in a row
+        — every match collapsed into a single bucket at minute 0 because
+        the CSS selector matched a wrapper element instead of the actual
+        per-minute bar divs, and that failure mode couldn't be diagnosed
+        or fixed further without live access to ESPN's page (blocked in
+        the dev sandbox this script is edited in). Rather than keep
+        gambling on fragile DOM-scraping, this computes a real,
+        defensible momentum signal from data we already reliably have.
+
+        Model (a standard approach for reconstructing match "flow" from
+        discrete events, used in public sports-analytics writeups):
+        - Every shot contributes a momentum impulse to its team, sized
+          by the shot's xG (a clear chance swings momentum more than a
+          speculative long-range effort).
+        - Goals contribute a large fixed impulse on top of their shot xG,
+          since a goal is a momentum event in itself, not just a shot.
+        - Cards/significant fouls give a SMALL impulse to the
+          OPPOSING team (conceding a card/foul typically reflects the
+          other side's pressure).
+        - Each impulse decays exponentially with a ~7-minute half-life,
+          so momentum rises sharply on a chance/goal and fades smoothly,
+          rather than spiking to zero between events.
+        - The final per-minute value is net team1-impulse minus net
+          team2-impulse, returned in the same _t1/_t2 shape the frontend
+          already expects.
         """
-        if not PLAYWRIGHT_AVAILABLE:
-            print("  [!] playwright not installed, skipping momentum scrape")
+        GOAL_IMPULSE   = 3.0
+        SHOT_WEIGHT    = 4.0     # multiplies xG to get a shot's impulse size
+        CARD_IMPULSE   = 0.8     # awarded to the opposing team
+        HALF_LIFE_MIN  = 7.0     # minutes for an impulse to decay to half strength
+        decay_k = math.log(2) / HALF_LIFE_MIN
+
+        # Collect raw (minute, team, impulse) events
+        impulses = []
+        for s in shots:
+            base = SHOT_WEIGHT * float(s.get("xg", 0) or 0)
+            if (s.get("outcome") or "").lower() == "goal":
+                base += GOAL_IMPULSE
+            impulses.append((s.get("minute", 0), s.get("team"), base))
+
+        for e in timeline:
+            etype = e.get("event_type")
+            if etype in ("yellow_card", "red_card", "foul"):
+                conceding_team = e.get("team")
+                # The impulse goes to whoever did NOT commit the card/foul
+                beneficiary = team2 if conceding_team == team1 else team1
+                weight = CARD_IMPULSE * (1.5 if etype == "red_card" else 1.0)
+                impulses.append((e.get("minute", 0), beneficiary, weight))
+
+        if not impulses:
             return []
-        try:
-            from playwright.sync_api import sync_playwright
 
-            url = f"{ESPN_WEB}/{game_id}"
-            bar_styles = []
-
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page(user_agent="Mozilla/5.0 (WorldCupDashboard/8.0)")
-                try:
-                    page.goto(url, timeout=20000, wait_until="domcontentloaded")
-                    # Momentum chart loads after initial paint; give it time
-                    page.wait_for_timeout(3500)
-
-                    # Grab every div whose inline style has both calc( and height:
-                    # (matches the exact pattern found via DevTools inspection)
-                    bar_styles = page.eval_on_selector_all(
-                        "div[style*='calc('][style*='height:']",
-                        "els => els.map(e => e.getAttribute('style'))"
-                    )
-                except Exception as inner_exc:
-                    print(f"  [!] Playwright navigation error: {inner_exc}")
-                finally:
-                    browser.close()
-
-            print(f"  [+] Found {len(bar_styles)} momentum bar divs (rendered)")
-            if not bar_styles:
-                return []
-
-            momentum_bars = []
-            half = len(bar_styles) // 2
-            for i, style in enumerate(bar_styles):
-                h_match = re.search(r'height:\s*([\d.]+)px', style)
-                l_match = re.search(r'left:\s*calc\(([\d.]+)%', style)
-                if not h_match or not l_match:
+        # Evaluate net momentum at each minute by summing decayed impulses
+        # from all events up to and including that minute (a causal,
+        # backward-looking decay — momentum reflects recent events only).
+        result = []
+        max_minute = max([match_length] + [i[0] for i in impulses])
+        for minute in range(0, int(max_minute) + 1):
+            t1_val = 0.0
+            t2_val = 0.0
+            for (ev_min, ev_team, weight) in impulses:
+                if ev_min > minute:
                     continue
-                height_px = float(h_match.group(1))
-                left_pct  = float(l_match.group(1))
-                minute    = round(left_pct * 90 / 100)
-                team      = team1 if i < half else team2
-                momentum_bars.append({"minute": minute, "team": team, "intensity": round(height_px, 2)})
+                age = minute - ev_min
+                decayed = weight * math.exp(-decay_k * age)
+                if decayed < 0.01:
+                    continue
+                if ev_team == team1:
+                    t1_val += decayed
+                elif ev_team == team2:
+                    t2_val += decayed
+            result.append({
+                "minute": minute,
+                team1:    round(t1_val, 3),
+                team2:    round(t2_val, 3),
+                "_t1":    round(t1_val, 3),
+                "_t2":    round(t2_val, 3),
+            })
 
-            buckets = {}
-            for bar in momentum_bars:
-                buckets.setdefault(bar["minute"], {team1: 0.0, team2: 0.0})
-                buckets[bar["minute"]][bar["team"]] += bar["intensity"]
-
-            result = []
-            for minute in sorted(buckets):
-                result.append({
-                    "minute": minute,
-                    team1:    round(buckets[minute].get(team1, 0), 2),
-                    team2:    round(buckets[minute].get(team2, 0), 2),
-                    "_t1":    round(buckets[minute].get(team1, 0), 2),
-                    "_t2":    round(buckets[minute].get(team2, 0), 2),
-                })
-            print(f"  [+] Momentum: {len(result)} time points (real ESPN data)")
-            return result
-
-        except Exception as exc:
-            print(f"  [!] Momentum scrape error: {exc}")
-            return []
+        print(f"  [+] Computed momentum: {len(result)} minute-points from {len(impulses)} real events")
+        return result
 
     # ------------------------------------------------------------------
     # Team names
@@ -420,22 +431,6 @@ class WorldCupDataCompiler:
 
         timeline.sort(key=lambda e: (e["period"], e["minute"]))
         return timeline, shots, buckets
-
-    # ------------------------------------------------------------------
-    # Shot-based momentum fallback
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _momentum_from_buckets(buckets, team1, team2):
-        return [
-            {
-                "minute": m,
-                team1:    buckets[m].get(team1, 0),
-                team2:    buckets[m].get(team2, 0),
-                "_t1":    buckets[m].get(team1, 0),
-                "_t2":    buckets[m].get(team2, 0),
-            }
-            for m in sorted(buckets)
-        ]
 
     # ------------------------------------------------------------------
     # Team stats
@@ -631,13 +626,14 @@ class WorldCupDataCompiler:
             timeline, espn_shots, buckets = self._extract_events(rosters)
             print(f"       timeline={len(timeline)} shots={len(espn_shots)}")
 
-            momentum = self.scrape_momentum(gid, team1, team2)
-            if not momentum:
-                print(f"       Falling back to shot-based momentum")
-                momentum = self._momentum_from_buckets(buckets, team1, team2)
-
             sb_shots = self._statsbomb_shots(team1, team2)
             shots = sb_shots if sb_shots else espn_shots
+
+            # Momentum is computed from real shot/event data (xG-weighted
+            # impulses with exponential decay) rather than scraped from
+            # ESPN's client-side-rendered momentum chart — see
+            # compute_momentum() docstring for why the scraper was dropped.
+            momentum = self.compute_momentum(timeline, shots, team1, team2)
 
             # Add a computed "Expected Goals (xG)" row to team_stats by
             # summing the per-shot xg values we just calculated. ESPN's
